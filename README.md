@@ -456,6 +456,127 @@ wav-output/output.wav
 
 服务端目前是“每段文本完整生成后返回”，不是逐 PCM 帧真流式；客户端会把分段 WAV 的 PCM 合并成一个有效 WAV 容器。
 
+## 实时性和 RTF
+
+交互客户端现在会在每段合成完成后打印 RTF，并在整轮文本保存完成后打印总 RTF。例如：
+
+```text
+第 1/1 段合成完成：耗时 3.17 秒；音频时长 2.72 秒；RTF=1.17（越小越实时）
+保存成功：/home/spacemit/projects/qwen3-tts/wav-output/output.wav
+音频时长：2.72 秒；本轮耗时：3.18 秒
+本轮 RTF：1.17（服务端统计；越小越实时；RTF<1 表示快于实时）
+```
+
+### RTF 的定义
+
+实时因子（Real-Time Factor，RTF）定义为：
+
+```text
+RTF = 生成耗时 / 生成音频时长
+```
+
+因此：
+
+| RTF | 含义 |
+| ---: | --- |
+| `< 1.0` | 生成速度快于播放速度，可以实时生成 |
+| `= 1.0` | 大约与播放速度相同 |
+| `> 1.0` | 生成速度慢于播放速度，不能在生成过程中完全追上实时播放 |
+
+RTF 越小越实时。RTF `1.20` 表示生成 1 秒音频大约需要 1.20 秒；RTF `0.80` 表示生成 1 秒音频大约需要 0.80 秒。
+
+### 客户端打印的数据来源
+
+Qwen3-TTS 服务端在 WAV HTTP 响应中提供以下统计头：
+
+```text
+X-TTS-Audio-Seconds
+X-TTS-Wall-Seconds
+X-TTS-RTF
+X-TTS-Segments
+```
+
+客户端优先使用服务端的 `X-TTS-RTF`。多段文本的“本轮 RTF”按所有分段的服务端 wall time 和音频时长合计计算，而不是简单平均每段 RTF。这样更能反映整轮请求的实际生成速度。
+
+如果连接到旧版服务端、响应中没有 `X-TTS-RTF`，客户端会使用 HTTP 请求耗时除以音频时长作为后备估计，并标记为“客户端测量”。这个后备值包含网络和 HTTP 往返时间；在本机 `127.0.0.1` 调用时影响通常较小，远程调用时不能与服务端纯生成 RTF 直接等价。
+
+### 查看 RTF
+
+交互模式：
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+./run_interactive.sh
+```
+
+单次模式也会打印 RTF：
+
+```bash
+./run_interactive.sh '你好，这是一次实时性测试。'
+```
+
+如果只想直接查看 HTTP 响应头：
+
+```bash
+curl -sS -D - -o /tmp/qwen3-tts-test.wav \
+  http://127.0.0.1:18080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-tts",
+    "input": "你好，这是一次实时性测试。",
+    "voice": "default",
+    "response_format": "wav",
+    "speed": 1.0
+  }'
+```
+
+### 2026 年 8 月 25 日 K3 实测结果
+
+测试环境：
+
+```text
+板端：SpaceMIT K3 / riscv64
+服务：127.0.0.1:18080
+Runtime：runtime/bin/llama-server
+SpaceMIT ORT：/usr/lib/libonnxruntime.so.1 + /usr/lib/libspacemit_ep.so
+输出：24 kHz、16-bit、mono WAV
+```
+
+本次测试使用当前板端运行配置：
+
+```text
+frontend_threads=2
+codec_threads=4
+talker_threads=4
+SPACEMIT_EP_INTRA_THREAD_NUM=4
+SPACEMIT_EP_INTER_THREAD_NUM=1
+主进程 CPU affinity=0-7
+```
+
+每种文本连续请求 3 次，结果如下；服务端 RTF 取 3 次结果的中位数：
+
+| 测试文本 | 文本长度 | 音频时长 | 服务端 RTF（3 次） | 中位数 |
+| --- | ---: | ---: | --- | ---: |
+| 短句 | 13 字符 | 2.72 秒 | 1.172 / 1.177 / 1.211 | 1.177 |
+| 中等句 | 45 字符 | 8.92 秒 | 1.111 / 1.132 / 1.123 | 1.123 |
+| 长句 | 81 字符 | 13.12 秒 | 1.082 / 1.090 / 1.096 | 1.090 |
+
+结论：当前配置下，服务端 RTF 约为 `1.09-1.18`。短句受模型初始化、请求和分段固定开销影响更明显；文本变长后固定开销被摊薄，RTF 下降，但当前仍略大于 `1.0`，所以不能认为已经达到严格意义上的实时生成。
+
+这次测试证明的是服务端 HTTP 请求级生成速度，不是逐 PCM 帧流式播放速度。当前服务仍然是“整段生成完成后返回 WAV”；要实现边生成边播放，需要改造 C++ talker/codec 回调和传输协议，单纯增加 RTF 打印不会改变这个行为。
+
+### 影响 RTF 的主要因素
+
+可以按下面顺序调优并重新测试：
+
+1. 保持 `sample_rate=24000`、`max_frames=160` 和 `max_prefill=128` 不变，先建立可比较基线；
+2. 调整 `SPACEMIT_EP_INTRA_THREAD_NUM`，例如比较 `4` 和 `8`；
+3. 在不造成线程争抢的前提下比较 `codec_threads=4/8`、`talker_threads=4/8`；
+4. 使用同一段文本连续测试至少 3 次，报告中位数，不要只看一次结果；
+5. 同时记录 CPU affinity、EP worker 数量、模型音色和 runtime/ORT 版本。
+
+增大线程数不保证 RTF 一定下降；如果线程池争抢、内存压力或驱动调度开销增加，RTF 可能变差。
+
 ## CPU、A100/X100 核与 SpaceMIT EP 线程配置
 
 本节区分三个容易混淆的概念：

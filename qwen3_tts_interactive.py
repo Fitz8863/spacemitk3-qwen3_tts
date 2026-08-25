@@ -34,6 +34,7 @@ class AudioChunk:
     wav: bytes
     synth_seconds: float
     audio_seconds: float | None
+    wall_seconds: float | None
     rtf: float | None
 
 
@@ -130,11 +131,20 @@ def synthesize(text: str) -> AudioChunk:
 
     if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
         raise RuntimeError("服务端没有返回有效的 WAV 音频")
+    audio_seconds = header_float("X-TTS-Audio-Seconds")
+    wall_seconds = header_float("X-TTS-Wall-Seconds")
+    rtf = header_float("X-TTS-RTF")
+    if rtf is None and audio_seconds and audio_seconds > 0:
+        # Keep the client usable with older servers that do not send the RTF
+        # header. This includes HTTP round-trip time, so the server value is
+        # preferred whenever it is available.
+        rtf = elapsed / audio_seconds
     return AudioChunk(
         wav=wav,
         synth_seconds=elapsed,
-        audio_seconds=header_float("X-TTS-Audio-Seconds"),
-        rtf=header_float("X-TTS-RTF"),
+        audio_seconds=audio_seconds,
+        wall_seconds=wall_seconds,
+        rtf=rtf,
     )
 
 
@@ -154,12 +164,24 @@ def save_speech(text: str) -> Path:
     temporary = destination.with_name(f".{destination.name}.part")
     expected_format: tuple[int, int, int, str] | None = None
     total_frames = 0
+    total_synth_seconds = 0.0
+    total_server_wall_seconds = 0.0
+    total_header_audio_seconds = 0.0
+    has_server_wall = False
+    has_header_audio = False
 
     print(f"已分成 {len(chunks)} 段，开始合成……", flush=True)
     try:
         with wave.open(str(temporary), "wb") as writer:
             for index, chunk_text in enumerate(chunks, start=1):
                 audio = synthesize(chunk_text)
+                total_synth_seconds += audio.synth_seconds
+                if audio.wall_seconds is not None and audio.wall_seconds >= 0:
+                    total_server_wall_seconds += audio.wall_seconds
+                    has_server_wall = True
+                if audio.audio_seconds is not None and audio.audio_seconds > 0:
+                    total_header_audio_seconds += audio.audio_seconds
+                    has_header_audio = True
                 with wave.open(io.BytesIO(audio.wav), "rb") as reader:
                     current_format = (
                         reader.getnchannels(),
@@ -184,8 +206,15 @@ def save_speech(text: str) -> Path:
                     total_frames += reader.getnframes()
                     writer.writeframesraw(frames)
 
+                rtf_text = f"RTF={audio.rtf:.2f}" if audio.rtf is not None else "RTF=未知"
+                audio_text = (
+                    f"；音频时长 {audio.audio_seconds:.2f} 秒"
+                    if audio.audio_seconds is not None
+                    else ""
+                )
                 print(
-                    f"第 {index}/{len(chunks)} 段合成完成：{audio.synth_seconds:.2f} 秒",
+                    f"第 {index}/{len(chunks)} 段合成完成：耗时 {audio.synth_seconds:.2f} 秒"
+                    f"{audio_text}；{rtf_text}（越小越实时）",
                     flush=True,
                 )
 
@@ -201,8 +230,22 @@ def save_speech(text: str) -> Path:
         raise RuntimeError("没有生成音频")
     duration = total_frames / expected_format[2]
     elapsed = time.monotonic() - started
+    if has_server_wall and has_header_audio and total_header_audio_seconds > 0:
+        total_rtf = total_server_wall_seconds / total_header_audio_seconds
+        rtf_source = "服务端统计"
+    elif duration > 0:
+        total_rtf = total_synth_seconds / duration
+        rtf_source = "客户端测量"
+    else:
+        total_rtf = None
+        rtf_source = "不可用"
+    total_rtf_text = f"{total_rtf:.2f}" if total_rtf is not None else "未知"
     print(f"保存成功：{destination}", flush=True)
     print(f"音频时长：{duration:.2f} 秒；本轮耗时：{elapsed:.2f} 秒", flush=True)
+    print(
+        f"本轮 RTF：{total_rtf_text}（{rtf_source}；越小越实时；RTF<1 表示快于实时）",
+        flush=True,
+    )
     return destination
 
 
