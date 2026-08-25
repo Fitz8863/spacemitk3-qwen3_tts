@@ -22,7 +22,7 @@
 | 服务 | `http://127.0.0.1:18080` |
 | Runtime | SpaceMIT 优化版 `llama-server`，当前构建标识 `787e5fcf` |
 | ORT | SpaceMIT ONNX Runtime / EP |
-| 默认音色 | `qwen3-tts-0.6b/default.spk.bin`，raw `float32[1024]` |
+| 音色配置 | `qwen3-tts-0.6b/config.json` 中的 `tts_model.speaker_file`；文件格式为 raw `float32[1024]` |
 
 ## 目录结构
 
@@ -298,7 +298,9 @@ wav-output/output.wav
 
 ## 五、音色格式和更换方式
 
-当前配置：
+### 5.1 音色文件和配置关系
+
+当前服务启动时会读取模型目录中的 `config.json`，再根据下面的配置加载一个固定的 speaker embedding：
 
 ```json
 {
@@ -308,30 +310,364 @@ wav-output/output.wav
 }
 ```
 
-`.spk.bin` 必须是：
+`speaker_file` 是相对于模型目录的文件名。假设项目目录是：
+
+```text
+/home/spacemit/projects/qwen3-tts
+```
+
+那么配置：
+
+```json
+"speaker_file": "anke.spk.bin"
+```
+
+实际读取的文件就是：
+
+```text
+/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
+```
+
+`.spk.bin` 文件必须满足：
 
 ```text
 raw little-endian float32[1024]
 4096 bytes
 ```
 
-将新音色放到模型目录并修改配置：
+它不是 WAV 文件，不能直接把 `.wav` 改名为 `.spk.bin` 使用。可以先用仓库中的音色预设，或者按照[第六节](#六从-wavmp3flac-克隆音色)从参考录音提取。
+
+仓库中已经提供的预设位于：
+
+```text
+voice_presets/embeddings/
+├── anke.spk.bin
+├── qwen_clone.spk.bin
+├── qwen_clone_1.spk.bin
+└── qwen_clone_2.spk.bin
+```
+
+查看某个文件是否符合格式：
 
 ```bash
-cp voice_presets/embeddings/anke.spk.bin qwen3-tts-0.6b/anke.spk.bin
+stat -c '%n: %s bytes' voice_presets/embeddings/*.spk.bin
+```
+
+每个文件应显示 `4096 bytes`。
+
+> 重要：音色 embedding 是服务启动时加载的。只复制文件或修改 `config.json`，不会改变已经运行的 `llama-server`；修改后必须重启 TTS 服务。
+
+### 5.2 推荐流程：切换到一个新音色
+
+下面以 `anke.spk.bin` 为例。命令分为“开发机”和“K3 板端”两部分，请不要把两个环境的路径混用。
+
+#### 第一步：从开发机复制音色到 K3 板端
+
+在本地开发机的仓库目录执行：
+
+```bash
+cd /home/heweijie/spacemit-k3-dev/projects/qwen3-tts
+
+scp voice_presets/embeddings/anke.spk.bin \
+  spacemit-k3:/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
+```
+
+在板端确认文件已经到位：
+
+```bash
+ssh spacemit-k3
+cd /home/spacemit/projects/qwen3-tts
+stat -c '%n: %s bytes' qwen3-tts-0.6b/anke.spk.bin
+```
+
+应显示：
+
+```text
+qwen3-tts-0.6b/anke.spk.bin: 4096 bytes
+```
+
+如果使用其他预设，只需要替换上面命令中的文件名。例如切换到 `qwen_clone.spk.bin`：
+
+```bash
+# 开发机执行
+scp voice_presets/embeddings/qwen_clone.spk.bin \
+  spacemit-k3:/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/qwen_clone.spk.bin
+```
+
+#### 第二步：在板端备份当前配置
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+
+cp -p qwen3-tts-0.6b/config.json \
+  "qwen3-tts-0.6b/config.json.before-voice-$(date +%Y%m%d-%H%M%S)"
+```
+
+先查看当前实际音色：
+
+```bash
 python3 - <<'PY'
 import json
 from pathlib import Path
+
 p = Path('qwen3-tts-0.6b/config.json')
-data = json.loads(p.read_text())
-data['tts_model']['speaker_file'] = 'anke.spk.bin'
-p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+data = json.loads(p.read_text(encoding='utf-8'))
+print(data['tts_model']['speaker_file'])
 PY
+```
+
+#### 第三步：修改 `speaker_file`
+
+推荐使用 Python 修改 JSON，不要用容易误替换其他字段的复杂 `sed` 命令：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+p = Path('qwen3-tts-0.6b/config.json')
+data = json.loads(p.read_text(encoding='utf-8'))
+data['tts_model']['speaker_file'] = 'anke.spk.bin'
+p.write_text(
+    json.dumps(data, ensure_ascii=False, indent=2) + '\n',
+    encoding='utf-8',
+)
+PY
+```
+
+确认配置和目标文件都正确：
+
+```bash
+grep -n 'speaker_file' qwen3-tts-0.6b/config.json
+test -f qwen3-tts-0.6b/anke.spk.bin
+test "$(stat -c '%s' qwen3-tts-0.6b/anke.spk.bin)" -eq 4096
+```
+
+应看到：
+
+```text
+"speaker_file": "anke.spk.bin"
+```
+
+如果这里提示文件不存在，先回到上一步重新执行 `scp`。如果文件大小不是 `4096`，说明复制的不是有效 speaker embedding，不能继续启动测试。
+
+#### 第四步：重启 TTS 服务
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+
 ./stop_server.sh
 ./start_server.sh
 ```
 
-当前请求中的 `voice: "default"` 是兼容字段，不会在多个 `.spk.bin` 文件之间自动选择。真正的请求级多音色需要后续扩展服务端映射。
+`start_server.sh` 会等待健康检查通过。也可以手动确认：
+
+```bash
+curl -fsS http://127.0.0.1:18080/health
+echo
+```
+
+正常结果：
+
+```json
+{"status":"ok"}
+```
+
+检查当前服务对应的进程和最近启动日志：
+
+```bash
+pid="$(cat llama-server.pid)"
+ps -fp "$pid"
+tail -n 80 llama-server.log
+```
+
+不要使用 `killall` 之类的宽泛命令；`stop_server.sh` 只根据本项目的 `llama-server.pid` 停止对应服务。
+
+#### 第五步：进入交互模式测试
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+./run_interactive.sh
+```
+
+看到输入提示后输入文本并回车，例如：
+
+```text
+安可音色测试，妈妈说过，只要相信，故事就会给人力量。
+```
+
+输入下面任意一个词退出：
+
+```text
+退出
+quit
+exit
+```
+
+也可以不进入持续交互，直接做一次单句测试：
+
+```bash
+./run_interactive.sh '这是安可音色的单句测试。'
+```
+
+较长文本可以降低每段长度，减少单段生成失败或截断的概率：
+
+```bash
+QWEN3_TTS_CHUNK_CHARS=24 ./run_interactive.sh \
+  '妈妈说过，只要相信，故事就会给人力量。所以每次想到这些故事的时候，安卡都觉得心里暖融融的。'
+```
+
+`run_interactive.sh` 在发现服务未运行时会自动调用 `start_server.sh`，但**音色配置变更后仍建议明确执行一次 `./stop_server.sh && ./start_server.sh`**，确保旧进程已经退出并重新加载新的 embedding。
+
+### 5.3 验证生成结果
+
+当前交互客户端不会自动播放，也不会按时间戳生成多个 WAV。每次成功合成都会原子覆盖：
+
+```text
+/home/spacemit/projects/qwen3-tts/wav-output/output.wav
+```
+
+生成后检查格式、时长和文件大小：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import wave
+
+p = Path('/home/spacemit/projects/qwen3-tts/wav-output/output.wav')
+print('path =', p.resolve())
+print('size =', p.stat().st_size, 'bytes')
+with wave.open(str(p), 'rb') as w:
+    print('channels =', w.getnchannels())
+    print('sample_width =', w.getsampwidth())
+    print('sample_rate =', w.getframerate())
+    print('frames =', w.getnframes())
+    print('seconds =', round(w.getnframes() / w.getframerate(), 3))
+PY
+```
+
+预期格式为：
+
+```text
+channels = 1
+sample_width = 2
+sample_rate = 24000
+```
+
+如需在开发机试听，可以把文件复制回来：
+
+```bash
+# 在开发机执行
+scp spacemit-k3:/home/spacemit/projects/qwen3-tts/wav-output/output.wav \
+  ./anke-test-output.wav
+```
+
+### 5.4 切换回默认音色
+
+如果之前保存了带时间戳的备份，可以先列出备份：
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+ls -lt qwen3-tts-0.6b/config.json.before-voice-*
+```
+
+选择需要恢复的备份文件，例如：
+
+```bash
+cp -p qwen3-tts-0.6b/config.json.before-voice-20260825-120000 \
+  qwen3-tts-0.6b/config.json
+```
+
+如果没有备份，也可以直接设置回默认文件名：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+p = Path('qwen3-tts-0.6b/config.json')
+data = json.loads(p.read_text(encoding='utf-8'))
+data['tts_model']['speaker_file'] = 'default.spk.bin'
+p.write_text(
+    json.dumps(data, ensure_ascii=False, indent=2) + '\n',
+    encoding='utf-8',
+)
+PY
+```
+
+恢复后同样必须重启服务：
+
+```bash
+./stop_server.sh
+./start_server.sh
+curl -fsS http://127.0.0.1:18080/health
+echo
+```
+
+### 5.5 通过 HTTP 接口测试
+
+`voice: "default"` 目前只是兼容 OpenAI 风格接口的字段，并不是请求级音色选择器。服务会使用启动时从 `speaker_file` 加载的音色：
+
+```bash
+curl -f http://127.0.0.1:18080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-tts",
+    "input": "这是通过 HTTP 接口进行的音色测试。",
+    "voice": "default",
+    "response_format": "wav",
+    "speed": 1.0
+  }' \
+  -o wav-output/output.wav
+```
+
+如果要验证不同音色，流程仍然是：修改 `config.json` → 重启服务 → 再调用接口。不能只修改请求中的 `voice` 值。
+
+### 5.6 音色替换没有生效时的检查顺序
+
+按以下顺序检查，不要只根据文件扩展名判断：
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+
+# 1. 看配置实际指向哪个文件
+grep -n 'speaker_file' qwen3-tts-0.6b/config.json
+
+# 2. 看文件是否存在且大小正确
+voice="$(python3 - <<'PY'
+import json
+print(json.load(open('qwen3-tts-0.6b/config.json'))['tts_model']['speaker_file'])
+PY
+)"
+stat -c '%n: %s bytes' "qwen3-tts-0.6b/$voice"
+
+# 3. 确认服务健康并取得当前 PID
+curl -fsS http://127.0.0.1:18080/health
+echo
+cat llama-server.pid
+
+# 4. 查看重启后的日志
+tail -n 100 llama-server.log
+```
+
+常见原因：
+
+1. 只复制了新的 `.spk.bin`，没有修改 `config.json`；
+2. 修改了 `config.json`，但没有重启已经运行的 `llama-server`；
+3. 文件放在项目根目录，而不是 `qwen3-tts-0.6b/` 模型目录；
+4. `speaker_file` 写成了绝对路径或错误的相对路径；
+5. 文件不是 raw `float32[1024]`，大小不是 `4096` 字节；
+6. 实际启动的不是当前项目目录中的服务，或者使用了另一份 `QWEN3_TTS_MODEL` 配置。
+
+确认服务已经停止并重新启动后，再进行交互测试：
+
+```bash
+./stop_server.sh
+./start_server.sh
+./run_interactive.sh '音色重新加载测试。'
+```
+
+当前 K3 HTTP 服务尚未实现上传 `ref_audio`/`ref_text` 后在线提取音色；生成 `.spk.bin` 后，必须按照本节流程部署并重启服务。
 
 ## 六、从 WAV/MP3/FLAC 克隆音色
 
