@@ -456,6 +456,293 @@ wav-output/output.wav
 
 服务端目前是“每段文本完整生成后返回”，不是逐 PCM 帧真流式；客户端会把分段 WAV 的 PCM 合并成一个有效 WAV 容器。
 
+## CPU、A100/X100 核与 SpaceMIT EP 线程配置
+
+本节区分三个容易混淆的概念：
+
+1. **Linux CPU 编号/亲和性**：由 `taskset` 和 `/proc/<pid>/task/<tid>/status` 表示；
+2. **SpaceMIT EP worker 线程数**：由模型 `config.json` 中的 `SPACEMIT_EP_INTRA_THREAD_NUM` 等参数控制；
+3. **实际 AI Core/算力单元调度**：由 SpaceMIT EP 和驱动完成，线程数或 `taskset` 不能单独证明某个算子实际使用了多少 AI Core。
+
+### K3 上的 CPU 编号
+
+当前这块 K3 板实测有 16 个 Linux CPU 编号：
+
+```text
+0-7   = X100
+8-15  = A100
+```
+
+可在板端确认：
+
+```bash
+ssh spacemit-k3
+lscpu
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+cat /sys/devices/system/cpu/online
+```
+
+当前 runtime 启动日志还会打印类似信息：
+
+```text
+num_cores: 16
+num_perfer_cores: 8
+cpu_mask: ff00
+aicpu_id_offset: 8
+```
+
+其中 `cpu_mask: ff00` 对应的首选范围是 Linux CPU `8-15`。这表示 runtime/EP 的默认首选 A100 范围，不等于已经通过用户配置选择了某几个固定 A100。
+
+### 当前 Qwen3-TTS 的线程配置
+
+配置文件：
+
+```text
+qwen3-tts-0.6b/config.json
+```
+
+当前相关配置：
+
+```json
+{
+  "frontend_threads": 2,
+  "codec_threads": 4,
+  "talker_threads": 4,
+  "ep_config": {
+    "SPACEMIT_EP_INTRA_THREAD_NUM": "4",
+    "SPACEMIT_EP_INTER_THREAD_NUM": "1"
+  }
+}
+```
+
+参数含义：
+
+| 参数 | 作用 |
+| --- | --- |
+| `frontend_threads` | 文本前处理和前端阶段线程数 |
+| `codec_threads` | codec 解码阶段线程数 |
+| `talker_threads` | talker 阶段线程数 |
+| `SPACEMIT_EP_INTRA_THREAD_NUM` | SpaceMIT EP 的内部并行线程数 |
+| `SPACEMIT_EP_INTER_THREAD_NUM` | SpaceMIT EP 图间并行线程数 |
+
+`SPACEMIT_EP_INTRA_THREAD_NUM=4` 只表示启动 4 个 EP worker，不表示选择 A100 `12-15`。当前 Qwen3-TTS runtime 没有在 `config.json` 中暴露类似下面的固定核列表配置：
+
+```json
+{
+  "SPACEMIT_EP_AFFINITY": "12;13;14;15"
+}
+```
+
+因此保持线程数为 4 时，当前默认分配通常是 A100 `8-11`。修改线程配置后必须重启服务：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+p = Path('qwen3-tts-0.6b/config.json')
+data = json.loads(p.read_text())
+tts = data['tts_model']
+tts['frontend_threads'] = 2
+tts['codec_threads'] = 4
+tts['talker_threads'] = 4
+tts['ep_config']['SPACEMIT_EP_INTRA_THREAD_NUM'] = '4'
+tts['ep_config']['SPACEMIT_EP_INTER_THREAD_NUM'] = '1'
+p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+PY
+
+./stop_server.sh
+./start_server.sh
+```
+
+### 使用全部 8 个 A100
+
+如果希望 EP 申请全部 8 个首选 A100，可以将内部线程数改为 8：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+p = Path('qwen3-tts-0.6b/config.json')
+data = json.loads(p.read_text())
+data['tts_model']['ep_config']['SPACEMIT_EP_INTRA_THREAD_NUM'] = '8'
+p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+PY
+
+./stop_server.sh
+./start_server.sh
+```
+
+这表示申请 A100 `8-15` 的 8 个 EP worker，**不是只使用后四个 A100**。如果机器上已经有旧的 `llama-server`，必须先用本项目的 `stop_server.sh` 停止，避免第二个实例报：
+
+```text
+Not enough available AI cores for the thread pool
+```
+
+### 只使用后四个 A100：当前版本的临时方法
+
+当前预编译 Qwen3-TTS runtime 没有提供持久化的 A100 核列表接口。服务已经启动并且 EP worker 仍显示为单核 `8`、`9`、`10`、`11` 时，可以将这四个 worker 一一绑定到 `12`、`13`、`14`、`15`：
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+pid="$(cat llama-server.pid)"
+kill -0 "$pid"
+
+for source_cpu in 8 9 10 11; do
+    target_cpu=$((source_cpu + 4))
+    for status in /proc/"$pid"/task/*/status; do
+        tid="${status%/status}"
+        tid="${tid##*/}"
+        affinity="$(awk '/^Cpus_allowed_list:/{print $2}' "$status")"
+        if [[ "$affinity" == "$source_cpu" ]]; then
+            echo "TID=$tid: CPU $source_cpu -> CPU $target_cpu"
+            taskset -pc "$target_cpu" "$tid"
+            break
+        fi
+    done
+done
+```
+
+检查结果：
+
+```bash
+for status in /proc/"$pid"/task/*/status; do
+    tid="${status%/status}"
+    tid="${tid##*/}"
+    affinity="$(awk '/^Cpus_allowed_list:/{print $2}' "$status")"
+    case "$affinity" in
+        12|13|14|15)
+            echo "TID=$tid affinity=$affinity"
+            ;;
+    esac
+done
+```
+
+注意：这种方式只修改**当前进程**。重启服务后，runtime 可能重新把四个 worker 放回 `8-11`。如果需要每次启动自动固定到 `12-15`，需要在 `start_server.sh` 中增加启动后自动识别 EP worker 并执行绑核的逻辑，或者重新编译暴露 affinity 配置的 SpaceMIT runtime。
+
+### X100 CPU 亲和性
+
+如果只想限制 `llama-server` 的普通 Linux CPU 调度范围，可以使用 `taskset`：
+
+```bash
+# 允许主进程和普通 CPU 线程使用全部 X100
+cd /home/spacemit/projects/qwen3-tts
+taskset -c 0-7 ./start_server.sh
+```
+
+也可以选择指定的 X100 子集：
+
+```bash
+taskset -c 0,2,4,6 ./start_server.sh
+```
+
+这里的 `taskset` 主要约束启动进程继承的 Linux CPU affinity，**不等价于选择 AI Core**。SpaceMIT EP worker 可能在初始化时使用自己的 A100 affinity；要确认实际结果，必须检查每个线程的 `Cpus_allowed_list`。
+
+某些 SSH 登录会话本身已经被限制在 CPU `0-7`。可以先查看：
+
+```bash
+taskset -pc $$
+```
+
+如果输出是：
+
+```text
+current affinity list: 0-7
+```
+
+那么在这个 Shell 中直接执行：
+
+```bash
+taskset -c 12-15 ./start_server.sh
+```
+
+可能会得到：
+
+```text
+taskset: failed to set pid ... affinity: Invalid argument
+```
+
+这不是 Qwen3-TTS 配置文件错误，而是当前 Shell/cpuset 不允许把自身扩展到 `12-15`。此时应使用上面的 EP worker 临时绑核方法，或通过系统级 service/cpuset 配置放开对应 CPU。
+
+### 验证线程和核是否生效
+
+先确认服务 PID 和健康状态：
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+pid="$(cat llama-server.pid)"
+ps -o pid,ppid,pgid,sid,stat,psr,pcpu,args -p "$pid"
+curl -fsS http://127.0.0.1:18080/health
+echo
+```
+
+查看主进程允许使用的 CPU：
+
+```bash
+taskset -pc "$pid"
+grep -E 'Threads|Cpus_allowed_list' "/proc/$pid/status"
+```
+
+查看所有线程当前运行 CPU 和允许的 CPU：
+
+```bash
+ps -T -p "$pid" -o spid,psr,pcpu,stat,comm
+
+for status in /proc/"$pid"/task/*/status; do
+    tid="${status%/status}"
+    tid="${tid##*/}"
+    printf 'TID=%s ' "$tid"
+    grep 'Cpus_allowed_list' "$status"
+done
+```
+
+查看 SpaceMIT EP 是否加载：
+
+```bash
+grep -E 'libonnxruntime|libspacemit_ep' \
+    "/proc/$pid/maps" | awk '{print $6}' | sort -u
+```
+
+需要注意：
+
+- `Cpus_allowed_list` 证明的是 Linux 线程 affinity；
+- `SPACEMIT_EP_INTRA_THREAD_NUM` 证明的是 EP 线程配置；
+- `libspacemit_ep.so` 出现在 maps 中证明加载了 SpaceMIT EP；
+- 这些证据不能单独证明所有算子都在 AI Core 上执行，也不能仅凭线程数推断实际使用了几个硬件 AI Core；
+- 若需要 AI Core 利用率、调度数量或算子级归属，需要 SpaceMIT 驱动日志、profile 或设备计数器。
+
+### 服务启动和停止的 PID 注意事项
+
+启动脚本会把 PID 写入：
+
+```text
+llama-server.pid
+```
+
+但如果启动过程中遇到旧服务已经占用端口、或新进程初始化失败，旧版本脚本可能把已经退出的新 PID 写入 PID 文件。当前 `stop_server.sh` 已改进为：
+
+- 校验 PID 对应的完整 `llama-server` 命令行；
+- PID 文件失效或丢失时扫描当前项目的实际 Qwen3-TTS 进程；
+- 优先向 `setsid` 创建的服务进程组发送 `SIGTERM`；
+- 超时后只对已确认的目标进程发送 `SIGKILL`；
+- 确认所有目标退出后才删除 PID 文件。
+
+推荐始终使用：
+
+```bash
+./stop_server.sh
+```
+
+不要使用：
+
+```bash
+killall llama-server
+pkill -f llama-server
+```
+
+因为这些命令可能误杀其他项目的服务。
+
 ## 五、音色格式和更换方式
 
 ### 5.1 音色文件和配置关系
