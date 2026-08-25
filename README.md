@@ -77,39 +77,199 @@ riscv64-linux-gnu-g++ --version || true
 
 如果 ORT 安装在其他目录，可以通过 `QWEN3_TTS_ORT_LIB_DIR` 指定。
 
-### 2. 获取模型文件
+### 2. 获取模型权重和模型文件
 
-将模型文件放到：
-
-```text
-/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/
-```
-
-目录至少需要：
+GitHub 仓库**不会提交**以下大文件：
 
 ```text
-config.json
-manifest.json
-tokenizer.gguf
-text-embed-proj.onnx
-codec-decoder-t50-q.onnx
-talker-q8_0.gguf
-code-predictor-q4_0.gguf
-qwen3-tts-aux.gguf
-default.spk.bin
+*.gguf
+*.onnx
+*.spk.bin
 ```
 
-模型文件体积较大，不通过普通 Git 提交。准备后检查：
+这是有意的：这些文件体积较大，而且模型权重、参考音色和运行时有各自的许可证及分发条款。克隆 GitHub 仓库后，必须按照下面的步骤另外下载并放到 K3 板端。
+
+#### 2.1 K3 部署应下载哪个模型仓库
+
+当前 K3 runtime 使用的是 SpaceMIT 已经转换好的 split-runtime 模型包：
+
+- **K3 推理模型包**：[`SpacemiT/Qwen3-TTS-0.6B`](https://huggingface.co/SpacemiT/Qwen3-TTS-0.6B)
+- **上游 Base 模型**：[`Qwen/Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base)
+
+K3 推理时应优先使用 `SpacemiT/Qwen3-TTS-0.6B`。它已经按照 SpaceMIT runtime 的方式拆分为 ONNX、GGUF 和 speaker embedding 文件，不能把上游 Hugging Face Base checkpoint 原样复制到 `qwen3-tts-0.6b/` 后直接启动。
+
+上游 `Qwen/Qwen3-TTS-12Hz-0.6B-Base` 主要用于开发机上的参考音频音色提取和 Python 端 voice cloning，具体见[第六节](#六从-wavmp3flac-克隆音色)。它不是当前 K3 `llama-server` 直接读取的文件布局。
+
+SpaceMIT 模型仓库当前列出的 K3 运行所需文件如下：
+
+| SpaceMIT 下载文件名 | 放入本项目后的文件名 | 用途 |
+| --- | --- | --- |
+| `Qwen3-TTS-0.6B-tokenizer.gguf` | `tokenizer.gguf` | tokenizer 元数据 |
+| `Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx` | `text-embed-proj.onnx` | 文本 embedding/projection |
+| `Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx` | `codec-decoder-t50-q.onnx` | codec decoder |
+| `Qwen3-TTS-0.6B-talker-q8_0.gguf` | `talker-q8_0.gguf` | talker |
+| `Qwen3-TTS-0.6B-code-predictor-q4_0.gguf` | `code-predictor-q4_0.gguf` | code predictor |
+| `Qwen3-TTS-0.6B-aux.gguf` | `qwen3-tts-aux.gguf` | runtime auxiliary tensors |
+| `default.spk.bin` | `default.spk.bin` | 默认 speaker embedding |
+
+项目中的 `config.json`、`manifest.json` 和 `SHA256SUMS` 已经随仓库提供，不要用下载包中的 `configs/K3/config.json` 直接覆盖项目配置；项目配置包含当前脚本和 runtime 使用的文件名。
+
+#### 2.2 推荐方式：在开发机下载，再复制到 K3
+
+推荐在有稳定网络的 x86_64 Linux 开发机或服务器下载，再通过 `scp` 复制到板端。先安装 Hugging Face CLI：
+
+```bash
+python3 -m pip install -U huggingface_hub
+```
+
+使用 `hf download` 下载 K3 模型包中的全部文件到临时目录：
+
+```bash
+mkdir -p /tmp/Qwen3-TTS-0.6B
+hf download SpacemiT/Qwen3-TTS-0.6B \
+  --include \
+  'Qwen3-TTS-0.6B-tokenizer.gguf' \
+  'Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx' \
+  'Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx' \
+  'Qwen3-TTS-0.6B-talker-q8_0.gguf' \
+  'Qwen3-TTS-0.6B-code-predictor-q4_0.gguf' \
+  'Qwen3-TTS-0.6B-aux.gguf' \
+  'default.spk.bin' \
+  --local-dir /tmp/Qwen3-TTS-0.6B
+```
+
+如果系统没有 `hf` 命令，可以使用旧版兼容命令：
+
+```bash
+huggingface-cli download SpacemiT/Qwen3-TTS-0.6B \
+  --include 'Qwen3-TTS-0.6B-*' 'default.spk.bin' \
+  --local-dir /tmp/Qwen3-TTS-0.6B
+```
+
+下载完成后，先检查临时目录中的文件：
+
+```bash
+find /tmp/Qwen3-TTS-0.6B -maxdepth 1 -type f -printf '%f: %s bytes\n' | sort
+```
+
+然后复制到板端临时目录：
+
+```bash
+ssh spacemit-k3 'mkdir -p /home/spacemit/projects/qwen3-tts/.model-download'
+scp /tmp/Qwen3-TTS-0.6B/{Qwen3-TTS-0.6B-tokenizer.gguf,Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx,Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx,Qwen3-TTS-0.6B-talker-q8_0.gguf,Qwen3-TTS-0.6B-code-predictor-q4_0.gguf,Qwen3-TTS-0.6B-aux.gguf,default.spk.bin} \
+  spacemit-k3:/home/spacemit/projects/qwen3-tts/.model-download/
+```
+
+在板端将官方文件名映射为本项目配置使用的文件名：
+
+```bash
+ssh spacemit-k3
+cd /home/spacemit/projects/qwen3-tts
+mkdir -p qwen3-tts-0.6b
+
+install -m 0644 .model-download/Qwen3-TTS-0.6B-tokenizer.gguf \
+  qwen3-tts-0.6b/tokenizer.gguf
+install -m 0644 .model-download/Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx \
+  qwen3-tts-0.6b/text-embed-proj.onnx
+install -m 0644 .model-download/Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx \
+  qwen3-tts-0.6b/codec-decoder-t50-q.onnx
+install -m 0644 .model-download/Qwen3-TTS-0.6B-talker-q8_0.gguf \
+  qwen3-tts-0.6b/talker-q8_0.gguf
+install -m 0644 .model-download/Qwen3-TTS-0.6B-code-predictor-q4_0.gguf \
+  qwen3-tts-0.6b/code-predictor-q4_0.gguf
+install -m 0644 .model-download/Qwen3-TTS-0.6B-aux.gguf \
+  qwen3-tts-0.6b/qwen3-tts-aux.gguf
+install -m 0644 .model-download/default.spk.bin \
+  qwen3-tts-0.6b/default.spk.bin
+```
+
+> 如果已经准备好自定义的 `anke.spk.bin` 或其他音色文件，不要用下载包中的 `default.spk.bin` 覆盖自定义文件。默认音色和自定义音色都应放在 `qwen3-tts-0.6b/`，再通过 `config.json` 的 `speaker_file` 选择。
+
+#### 2.3 直接在 K3 板端下载
+
+如果 K3 可以访问 Hugging Face，也可以直接在板端下载。先确认 `hf` 命令可用：
+
+```bash
+ssh spacemit-k3
+python3 -m pip install --user -U huggingface_hub
+```
+
+然后在项目目录外的临时目录下载，避免把官方长文件名直接混入项目模型目录：
 
 ```bash
 cd /home/spacemit/projects/qwen3-tts
-for f in qwen3-tts-0.6b/{tokenizer.gguf,text-embed-proj.onnx,codec-decoder-t50-q.onnx,talker-q8_0.gguf,code-predictor-q4_0.gguf,qwen3-tts-aux.gguf,default.spk.bin}; do
-    test -f "$f" || { echo "missing: $f"; exit 1; }
-done
-cat qwen3-tts-0.6b/SHA256SUMS
+mkdir -p .model-download
+hf download SpacemiT/Qwen3-TTS-0.6B \
+  --include \
+  'Qwen3-TTS-0.6B-tokenizer.gguf' \
+  'Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx' \
+  'Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx' \
+  'Qwen3-TTS-0.6B-talker-q8_0.gguf' \
+  'Qwen3-TTS-0.6B-code-predictor-q4_0.gguf' \
+  'Qwen3-TTS-0.6B-aux.gguf' \
+  'default.spk.bin' \
+  --local-dir .model-download
 ```
 
-`SHA256SUMS` 中的大文件校验项应与实际下载来源对应；若模型被重新量化或替换，不要继续沿用旧校验值。
+执行上一小节中的 `install` 命令完成文件名映射。
+
+如果板端网络无法访问 Hugging Face，使用 2.2 节的“开发机下载 + `scp`”方式；不要反复在板端执行不完整下载。
+
+#### 2.4 下载后检查模型文件
+
+在 K3 板端执行：
+
+```bash
+cd /home/spacemit/projects/qwen3-tts
+
+required=(
+  tokenizer.gguf
+  text-embed-proj.onnx
+  codec-decoder-t50-q.onnx
+  talker-q8_0.gguf
+  code-predictor-q4_0.gguf
+  qwen3-tts-aux.gguf
+  default.spk.bin
+)
+
+for f in "${required[@]}"; do
+  test -s "qwen3-tts-0.6b/$f" || {
+    echo "missing or empty: qwen3-tts-0.6b/$f" >&2
+    exit 1
+  }
+done
+
+stat -c '%n: %s bytes' qwen3-tts-0.6b/*.{gguf,onnx,bin}
+sha256sum -c qwen3-tts-0.6b/SHA256SUMS
+```
+
+`sha256sum -c` 全部通过后，再启动服务：
+
+```bash
+./start_server.sh
+curl -fsS http://127.0.0.1:18080/health
+echo
+```
+
+`SHA256SUMS` 对应的是项目重命名后的文件名。如果你替换了 talker、codec、speaker 或其他模型文件，不要继续沿用旧的哈希值；应重新生成校验值并在部署记录中标注来源、版本和修改原因。
+
+#### 2.5 哪些文件不需要从模型仓库下载
+
+以下文件已经由本项目管理，通常不需要从模型仓库重新下载：
+
+```text
+runtime/bin/llama-server
+runtime/bin/libggml*.so*
+runtime/bin/libllama*.so*
+runtime/bin/libmtmd.so*
+start_server.sh
+stop_server.sh
+run_interactive.sh
+qwen3-tts-0.6b/config.json
+qwen3-tts-0.6b/manifest.json
+```
+
+其中 `runtime/bin/` 是针对 K3/riscv64 的预编译 runtime；它和模型权重是两套不同的东西。若需要从源码重新编译或更换 runtime，请看[第三节：从源码编译 runtime](#三从源码编译-runtime)。
 
 ## 二、直接使用仓库中的预编译 runtime
 
