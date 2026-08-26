@@ -5,7 +5,7 @@
 - K3 上运行的优化版 `llama-server` runtime；
 - Qwen3-TTS 模型配置和启动脚本；
 - OpenAI 风格的 HTTP 语音合成接口；
-- 交互式/单次生成 WAV 的客户端；
+- 交互式/单次低延迟分段流式播放客户端；
 - 多个 speaker embedding 预设；
 - 将 WAV/MP3/FLAC 参考录音转换成 K3 所需 `.spk.bin` 的离线脚本；本地 Base checkpoint 可只读取 speaker encoder 权重。
 
@@ -18,7 +18,7 @@
 | 目标板 | SpaceMIT K3，riscv64 |
 | 系统 | Bianbu Linux（板端实际版本以 `cat /etc/os-release` 为准） |
 | TTS 模型 | Qwen3-TTS 0.6B |
-| 输出 | 24 kHz、16-bit、mono、PCM WAV |
+| 播放 | 24 kHz、16-bit、mono、PCM（通过 aplay 直接播放） |
 | 服务 | `http://127.0.0.1:18080` |
 | Runtime | SpaceMIT 优化版 `llama-server`，当前构建标识 `787e5fcf` |
 | ORT | SpaceMIT ONNX Runtime / EP |
@@ -444,26 +444,45 @@ curl -f http://127.0.0.1:18080/v1/audio/speech \
 
 ```bash
 ./run_interactive.sh
-./run_interactive.sh '你好，这是一次单句合成。'
+./run_interactive.sh '你好，这是一次低延迟播放测试。'
 QWEN3_TTS_CHUNK_CHARS=24 ./run_interactive.sh '这里是一段较长的文本。'
 ```
 
-输出固定为：
+当前默认行为是**低延迟直接播放，不保存 WAV**：每段 HTTP WAV 返回后立即解包为 PCM，首段就绪就启动一个长生命周期的 `aplay`，后续分段继续生成并直接送入同一个播放器。若只做合成测速而不播放：
 
-```text
-wav-output/output.wav
+```bash
+./run_interactive.sh --no-play '这次只合成、不播放。'
 ```
 
-服务端目前是“每段文本完整生成后返回”，不是逐 PCM 帧真流式；客户端会把分段 WAV 的 PCM 合并成一个有效 WAV 容器。
+可调的低延迟参数：
+
+```text
+QWEN3_TTS_CHUNK_CHARS=24             # 分段越短，首播通常越早，但段间空隙风险越高
+QWEN3_TTS_STREAM_LOW_LATENCY=1       # 默认；首个完整分段返回后立即播放
+QWEN3_TTS_STREAM_LOW_LATENCY=0       # 保守模式；按 RTF 估算后再预缓冲
+QWEN3_TTS_PLAYBACK_BUFFER_US=250000   # ALSA/PipeWire 播放缓冲，默认 250 ms
+QWEN3_TTS_PLAYBACK_PERIOD_US=30000    # 播放周期，默认 30 ms
+QWEN3_TTS_PLAYBACK_START_DELAY_US=0   # 播放启动额外延时，默认 0
+QWEN3_TTS_PLAYBACK_QUEUE_SEGMENTS=2   # 客户端最多排队的完整分段数
+```
+
+播放缓冲已经从开发板默认约 500 ms 降到约 250 ms，周期约 30 ms。这样比原实现更低延迟，同时给板端 PipeWire 桥接保留一定抗 underrun 余量。继续减小可能降低延迟，但更容易触发 ALSA/PipeWire underrun，出现爆音或短暂停顿；如果板端音频设备不稳定，可临时恢复：
+
+```bash
+QWEN3_TTS_PLAYBACK_BUFFER_US=400000 QWEN3_TTS_PLAYBACK_PERIOD_US=50000 ./run_interactive.sh
+```
+
+服务端目前仍是“每段文本完整生成后返回”，不是逐 PCM 帧真流式。因此首播下限仍然是**第一段的完整生成耗时**；仅修改 Python 客户端无法在第一段 WAV 返回前播放。当前低延迟模式优先缩短首播，接受在 RTF 大于 1 时后续分段之间可能出现短暂停顿。要做到单段内部边生成边播放，需要继续改造 C++ talker/codec 回调和 HTTP 传输协议。
 
 ## 实时性和 RTF
 
-交互客户端现在会在每段合成完成后打印 RTF，并在整轮文本保存完成后打印总 RTF。例如：
+交互客户端现在会在每段合成完成后打印 RTF，并在播放结束后打印总 RTF。例如：
 
 ```text
 第 1/1 段合成完成：耗时 3.17 秒；音频时长 2.72 秒；RTF=1.17（越小越实时）
-保存成功：/home/spacemit/projects/qwen3-tts/wav-output/output.wav
-音频时长：2.72 秒；本轮耗时：3.18 秒
+开始低延迟播放：首段已就绪，已缓存 2.72 秒音频；后续分段将边生成边播放
+播放完成。
+音频时长：2.72 秒；合成耗时：3.18 秒；播放结束耗时：5.90 秒；首播延迟：3.18 秒
 本轮 RTF：1.17（服务端统计；越小越实时；RTF<1 表示快于实时）
 ```
 
@@ -563,7 +582,9 @@ SPACEMIT_EP_INTER_THREAD_NUM=1
 
 结论：当前配置下，服务端 RTF 约为 `1.09-1.18`。短句受模型初始化、请求和分段固定开销影响更明显；文本变长后固定开销被摊薄，RTF 下降，但当前仍略大于 `1.0`，所以不能认为已经达到严格意义上的实时生成。
 
-这次测试证明的是服务端 HTTP 请求级生成速度，不是逐 PCM 帧流式播放速度。当前服务仍然是“整段生成完成后返回 WAV”；要实现边生成边播放，需要改造 C++ talker/codec 回调和传输协议，单纯增加 RTF 打印不会改变这个行为。
+2026 年 8 月 26 日本次流式回归又测得：短句服务端 RTF `1.188`，两段中等文本服务端 RTF `1.212`；因此客户端默认使用 `QWEN3_TTS_STREAM_RTF_HINT=1.20`，再乘以 `QWEN3_TTS_STREAM_RTF_SAFETY=1.05` 作为预缓冲保护值。实际每轮仍优先使用响应头中的服务端 RTF 动态修正。
+
+这次测试证明的是服务端 HTTP 请求级生成速度，不是逐 PCM 帧流式速度。当前服务仍然是“整段生成完成后返回 WAV”，Python 客户端现在默认在第一段完整返回后立即播放，并一边播放一边生成后续分段；若要在单个分段内部边解码边播放，仍需改造 C++ talker/codec 回调和 HTTP 传输协议。
 
 ### 影响 RTF 的主要因素
 
@@ -1087,48 +1108,31 @@ QWEN3_TTS_CHUNK_CHARS=24 ./run_interactive.sh \
 
 `run_interactive.sh` 在发现服务未运行时会自动调用 `start_server.sh`，但**音色配置变更后仍建议明确执行一次 `./stop_server.sh && ./start_server.sh`**，确保旧进程已经退出并重新加载新的 embedding。
 
-### 5.3 验证生成结果
+### 5.3 验证播放
 
-当前交互客户端不会自动播放，也不会按时间戳生成多个 WAV。每次成功合成都会原子覆盖：
-
-```text
-/home/spacemit/projects/qwen3-tts/wav-output/output.wav
-```
-
-生成后检查格式、时长和文件大小：
+当前交互客户端默认只播放，不自动创建或覆盖 WAV 文件：
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-import wave
-
-p = Path('/home/spacemit/projects/qwen3-tts/wav-output/output.wav')
-print('path =', p.resolve())
-print('size =', p.stat().st_size, 'bytes')
-with wave.open(str(p), 'rb') as w:
-    print('channels =', w.getnchannels())
-    print('sample_width =', w.getsampwidth())
-    print('sample_rate =', w.getframerate())
-    print('frames =', w.getnframes())
-    print('seconds =', round(w.getnframes() / w.getframerate(), 3))
-PY
+cd /home/spacemit/projects/qwen3-tts
+timeout 40s ./run_interactive.sh '这是安可音色的低延迟播放测试。'
 ```
 
-预期格式为：
+预期日志包含：
 
 ```text
-channels = 1
-sample_width = 2
-sample_rate = 24000
+开始低延迟播放：首段已就绪
+播放完成。
+首播延迟：... 秒
 ```
 
-如需在开发机试听，可以把文件复制回来：
+确认播放器退出且没有临时 WAV：
 
 ```bash
-# 在开发机执行
-scp spacemit-k3:/home/spacemit/projects/qwen3-tts/wav-output/output.wav \
-  ./anke-test-output.wav
+pgrep -af '[a]play' || true
+find /home/spacemit/projects/qwen3-tts/wav-output -maxdepth 1 -type f -name '.output.wav.part' -print
 ```
+
+如果要保留 HTTP 返回的 WAV，可继续直接使用 `curl -o` 保存；交互客户端本身不会保存。
 
 ### 5.4 切换回默认音色
 
