@@ -9,7 +9,7 @@
 - 多个 speaker embedding 预设；
 - 将 WAV/MP3/FLAC 参考录音转换成 K3 所需 `.spk.bin` 的离线脚本；本地 Base checkpoint 可只读取 speaker encoder 权重。
 
-> 当前仓库不提交大模型的 ONNX/GGUF 权重，也不提交运行时生成的 WAV、日志和 PID 文件。大文件需要在 K3 板端单独准备。
+> 当前仓库不提交模型目录中的 ONNX/GGUF 权重和默认运行时 `.spk.bin`，也不提交运行时生成的 WAV、日志和 PID 文件。模型大文件需要在 K3 板端单独准备；`voice_presets/` 中已提交的预设可以直接复制使用。
 
 ## 当前验证环境
 
@@ -91,14 +91,15 @@ riscv64-linux-gnu-g++ --version || true
 
 ### 2. 获取模型权重和模型文件
 
-GitHub 仓库**不会提交**以下大模型文件：
+GitHub 仓库**不会提交**模型目录中的以下大文件：
 
 ```text
-*.gguf
-*.onnx
+qwen3-tts-0.6b/*.gguf
+qwen3-tts-0.6b/*.onnx
+qwen3-tts-0.6b/*.bin
 ```
 
-`real_time` 分支额外包含一个 4096 字节的 `qwen3-tts-0.6b/anke.spk.bin` 预设，便于直接使用；如果切换到其他分支或使用自定义音色，请确保 `config.json` 中 `speaker_file` 指向的文件存在。
+`real_time` 分支中的 `qwen3-tts-0.6b/anke.spk.bin` 是随分支提供的 4096 字节音色预设，便于直接使用；其他模型大文件仍需另外下载。如果切换到其他分支或使用自定义音色，请确保 `config.json` 中 `speaker_file` 指向的文件存在。
 
 这是有意的：这些文件体积较大，而且模型权重、参考音色和运行时有各自的许可证及分发条款。克隆 GitHub 仓库后，必须按照下面的步骤另外下载并放到 K3 板端。
 
@@ -170,7 +171,7 @@ find /tmp/Qwen3-TTS-0.6B -maxdepth 1 -type f -printf '%f: %s bytes\n' | sort
 ```bash
 ssh "$BOARD_SSH" 'mkdir -p ~/qwen3-tts/.model-download'
 scp /tmp/Qwen3-TTS-0.6B/{Qwen3-TTS-0.6B-tokenizer.gguf,Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx,Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx,Qwen3-TTS-0.6B-talker-q8_0.gguf,Qwen3-TTS-0.6B-code-predictor-q4_0.gguf,Qwen3-TTS-0.6B-aux.gguf,default.spk.bin} \
-  $BOARD_SSH:~/qwen3-tts/.model-download/
+  "${BOARD_SSH}:~/qwen3-tts/.model-download/"
 ```
 
 在板端将官方文件名映射为本项目配置使用的文件名：
@@ -293,7 +294,7 @@ ssh "$BOARD_SSH" 'mkdir -p ~/qwen3-tts'
 rsync -a --delete \
   --exclude='qwen3-tts-0.6b/*.gguf' \
   --exclude='qwen3-tts-0.6b/*.onnx' \
-  ./ $BOARD_SSH:~/qwen3-tts/
+  ./ "${BOARD_SSH}:~/qwen3-tts/"
 ```
 
 然后在板端补齐模型大文件：
@@ -381,7 +382,7 @@ set(CMAKE_SYSTEM_PROCESSOR riscv64)
 set(CMAKE_C_COMPILER riscv64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 # 按实际 SDK 修改：
-# set(CMAKE_SYSROOT /opt/k3-sysroot)
+# set(CMAKE_SYSROOT /path/to/k3-sysroot)
 ```
 
 执行：
@@ -969,7 +970,7 @@ stat -c '%n: %s bytes' voice_presets/embeddings/*.spk.bin
 ```bash
 # 在开发机的仓库根目录执行
 scp voice_presets/embeddings/anke.spk.bin \
-  $BOARD_SSH:~/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
+  "${BOARD_SSH}:~/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin"
 ```
 
 在板端确认文件已经到位：
@@ -991,7 +992,7 @@ qwen3-tts-0.6b/anke.spk.bin: 4096 bytes
 ```bash
 # 开发机执行
 scp voice_presets/embeddings/qwen_clone.spk.bin \
-  $BOARD_SSH:~/qwen3-tts/qwen3-tts-0.6b/qwen_clone.spk.bin
+  "${BOARD_SSH}:~/qwen3-tts/qwen3-tts-0.6b/qwen_clone.spk.bin"
 ```
 
 #### 第二步：在板端备份当前配置
@@ -1260,7 +1261,7 @@ tail -n 100 llama-server.log
 python voice_embeddings/extract_speaker_embedding.py \
   --input '/path/to/reference.wav' \
   --output voice_presets/embeddings/my_voice.spk.bin \
-  --model /data/models/Qwen3-TTS-12Hz-0.6B-Base \
+  --model /path/to/Qwen3-TTS-12Hz-0.6B-Base \
   --ref-text '参考音频的逐字稿' \
   --device cpu \
   --dtype float32 \
@@ -1269,7 +1270,7 @@ python voice_embeddings/extract_speaker_embedding.py \
 
 这个步骤要在支持 PyTorch/Qwen3-TTS 的开发机或服务器上运行。推荐把 `Qwen/Qwen3-TTS-12Hz-0.6B-Base` 下载到本地目录后使用；脚本只加载 speaker encoder，通常不需要完整 talker/codec 推理。当前 K3 HTTP 服务本身还没有实现上传 `ref_audio`/`ref_text` 后在线提取；生成 `.spk.bin` 后，再按上一节部署。
 
-本次用户提供的音频已作为 `anke` 音色的提取输入。原始录音不提交到仓库，只提交提取结果和哈希/模型元数据。
+仓库只提交已提取的 `.spk.bin` 和元数据，不提交任何原始参考录音。
 
 ## 七、已下载音色预设
 
