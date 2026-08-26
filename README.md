@@ -37,9 +37,9 @@
 ├── qwen3-tts-0.6b/
 │   ├── config.json
 │   ├── manifest.json
-│   ├── default.spk.bin       # 板端准备；默认被 .gitignore 忽略
-│   ├── *.gguf                # 板端准备；默认被 .gitignore 忽略
-│   └── *.onnx                # 板端准备；默认被 .gitignore 忽略
+│   ├── anke.spk.bin          # real_time 分支已包含；其他分支按配置准备
+│   ├── *.gguf              # 板端准备；默认被 .gitignore 忽略
+│   └── *.onnx              # 板端准备；默认被 .gitignore 忽略
 ├── runtime/bin/               # riscv64 预编译 runtime
 ├── voice_embeddings/
 │   ├── extract_speaker_embedding.py
@@ -52,10 +52,22 @@
 
 ## 一、准备环境
 
+### 0. 设置本地仓库和开发板连接信息
+
+以下命令不依赖某台机器的固定目录。先在开发机上克隆仓库，并把 `BOARD_SSH` 改成你自己的 SSH 用户和主机（也可以使用 `~/.ssh/config` 中的别名）：
+
+```bash
+git clone https://github.com/Fitz8863/spacemitk3-qwen3_tts.git
+cd spacemitk3-qwen3_tts
+export BOARD_SSH="user@your-k3-host"
+```
+
+本文后续在开发机执行的命令使用当前仓库目录，在 K3 板端执行的命令使用 `~/qwen3-tts`。如果你把仓库克隆到其他目录，只需要先 `cd` 到该目录；如果板端项目目录不同，请把示例中的 `~/qwen3-tts` 统一替换为你的目录。
+
 ### 1. 在 K3 板端准备系统依赖
 
 ```bash
-ssh spacemit-k3
+ssh "$BOARD_SSH"
 sudo apt update
 sudo apt install -y curl ca-certificates file ffmpeg
 ```
@@ -79,13 +91,14 @@ riscv64-linux-gnu-g++ --version || true
 
 ### 2. 获取模型权重和模型文件
 
-GitHub 仓库**不会提交**以下大文件：
+GitHub 仓库**不会提交**以下大模型文件：
 
 ```text
 *.gguf
 *.onnx
-*.spk.bin
 ```
+
+`real_time` 分支额外包含一个 4096 字节的 `qwen3-tts-0.6b/anke.spk.bin` 预设，便于直接使用；如果切换到其他分支或使用自定义音色，请确保 `config.json` 中 `speaker_file` 指向的文件存在。
 
 这是有意的：这些文件体积较大，而且模型权重、参考音色和运行时有各自的许可证及分发条款。克隆 GitHub 仓库后，必须按照下面的步骤另外下载并放到 K3 板端。
 
@@ -155,16 +168,16 @@ find /tmp/Qwen3-TTS-0.6B -maxdepth 1 -type f -printf '%f: %s bytes\n' | sort
 然后复制到板端临时目录：
 
 ```bash
-ssh spacemit-k3 'mkdir -p /home/spacemit/projects/qwen3-tts/.model-download'
+ssh "$BOARD_SSH" 'mkdir -p ~/qwen3-tts/.model-download'
 scp /tmp/Qwen3-TTS-0.6B/{Qwen3-TTS-0.6B-tokenizer.gguf,Qwen3-TTS-0.6B-text-embed-proj.fp32.onnx,Qwen3-TTS-0.6B-codec-decoder-t50.dynq.onnx,Qwen3-TTS-0.6B-talker-q8_0.gguf,Qwen3-TTS-0.6B-code-predictor-q4_0.gguf,Qwen3-TTS-0.6B-aux.gguf,default.spk.bin} \
-  spacemit-k3:/home/spacemit/projects/qwen3-tts/.model-download/
+  $BOARD_SSH:~/qwen3-tts/.model-download/
 ```
 
 在板端将官方文件名映射为本项目配置使用的文件名：
 
 ```bash
-ssh spacemit-k3
-cd /home/spacemit/projects/qwen3-tts
+ssh "$BOARD_SSH"
+cd ~/qwen3-tts
 mkdir -p qwen3-tts-0.6b
 
 install -m 0644 .model-download/Qwen3-TTS-0.6B-tokenizer.gguf \
@@ -190,14 +203,14 @@ install -m 0644 .model-download/default.spk.bin \
 如果 K3 可以访问 Hugging Face，也可以直接在板端下载。先确认 `hf` 命令可用：
 
 ```bash
-ssh spacemit-k3
+ssh "$BOARD_SSH"
 python3 -m pip install --user -U huggingface_hub
 ```
 
 然后在项目目录外的临时目录下载，避免把官方长文件名直接混入项目模型目录：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 mkdir -p .model-download
 hf download SpacemiT/Qwen3-TTS-0.6B \
   --include \
@@ -220,7 +233,7 @@ hf download SpacemiT/Qwen3-TTS-0.6B \
 在 K3 板端执行：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 
 required=(
   tokenizer.gguf
@@ -276,19 +289,18 @@ qwen3-tts-0.6b/manifest.json
 这是当前 K3 最推荐的方式。先把项目放到板端约定目录：
 
 ```bash
-ssh spacemit-k3 'mkdir -p /home/spacemit/projects'
+ssh "$BOARD_SSH" 'mkdir -p ~/qwen3-tts'
 rsync -a --delete \
   --exclude='qwen3-tts-0.6b/*.gguf' \
   --exclude='qwen3-tts-0.6b/*.onnx' \
-  --exclude='qwen3-tts-0.6b/*.bin' \
-  ./ spacemit-k3:/home/spacemit/projects/qwen3-tts/
+  ./ $BOARD_SSH:~/qwen3-tts/
 ```
 
 然后在板端补齐模型大文件：
 
 ```bash
-ssh spacemit-k3
-cd /home/spacemit/projects/qwen3-tts
+ssh "$BOARD_SSH"
+cd ~/qwen3-tts
 chmod +x start_server.sh stop_server.sh run_interactive.sh
 ./start_server.sh
 curl -fsS http://127.0.0.1:18080/health
@@ -337,8 +349,8 @@ tail -200 llama-server.log
 准备与当前 runtime 对应的 SpaceMIT 源码目录，例如：
 
 ```bash
-ssh spacemit-k3
-cd /home/spacemit/src
+ssh "$BOARD_SSH"
+cd ~/src
 # 将 SpaceMIT 定制版 llama.cpp 源码放到此处
 cd llama.cpp
 
@@ -524,7 +536,7 @@ X-TTS-Segments
 交互模式：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 ./run_interactive.sh
 ```
 
@@ -618,7 +630,7 @@ SPACEMIT_EP_INTER_THREAD_NUM=1
 可在板端确认：
 
 ```bash
-ssh spacemit-k3
+ssh "$BOARD_SSH"
 lscpu
 lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
 cat /sys/devices/system/cpu/online
@@ -727,7 +739,7 @@ Not enough available AI cores for the thread pool
 当前预编译 Qwen3-TTS runtime 没有提供持久化的 A100 核列表接口。服务已经启动并且 EP worker 仍显示为单核 `8`、`9`、`10`、`11` 时，可以将这四个 worker 一一绑定到 `12`、`13`、`14`、`15`：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 pid="$(cat llama-server.pid)"
 kill -0 "$pid"
 
@@ -769,7 +781,7 @@ done
 
 ```bash
 # 允许主进程和普通 CPU 线程使用全部 X100
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 taskset -c 0-7 ./start_server.sh
 ```
 
@@ -812,7 +824,7 @@ taskset: failed to set pid ... affinity: Invalid argument
 先确认服务 PID 和健康状态：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 pid="$(cat llama-server.pid)"
 ps -o pid,ppid,pgid,sid,stat,psr,pcpu,args -p "$pid"
 curl -fsS http://127.0.0.1:18080/health
@@ -902,7 +914,7 @@ pkill -f llama-server
 `speaker_file` 是相对于模型目录的文件名。假设项目目录是：
 
 ```text
-/home/spacemit/projects/qwen3-tts
+~/qwen3-tts
 ```
 
 那么配置：
@@ -914,7 +926,7 @@ pkill -f llama-server
 实际读取的文件就是：
 
 ```text
-/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
+~/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
 ```
 
 `.spk.bin` 文件必须满足：
@@ -955,17 +967,16 @@ stat -c '%n: %s bytes' voice_presets/embeddings/*.spk.bin
 在本地开发机的仓库目录执行：
 
 ```bash
-cd /home/heweijie/spacemit-k3-dev/projects/qwen3-tts
-
+# 在开发机的仓库根目录执行
 scp voice_presets/embeddings/anke.spk.bin \
-  spacemit-k3:/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
+  $BOARD_SSH:~/qwen3-tts/qwen3-tts-0.6b/anke.spk.bin
 ```
 
 在板端确认文件已经到位：
 
 ```bash
-ssh spacemit-k3
-cd /home/spacemit/projects/qwen3-tts
+ssh "$BOARD_SSH"
+cd ~/qwen3-tts
 stat -c '%n: %s bytes' qwen3-tts-0.6b/anke.spk.bin
 ```
 
@@ -980,13 +991,13 @@ qwen3-tts-0.6b/anke.spk.bin: 4096 bytes
 ```bash
 # 开发机执行
 scp voice_presets/embeddings/qwen_clone.spk.bin \
-  spacemit-k3:/home/spacemit/projects/qwen3-tts/qwen3-tts-0.6b/qwen_clone.spk.bin
+  $BOARD_SSH:~/qwen3-tts/qwen3-tts-0.6b/qwen_clone.spk.bin
 ```
 
 #### 第二步：在板端备份当前配置
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 
 cp -p qwen3-tts-0.6b/config.json \
   "qwen3-tts-0.6b/config.json.before-voice-$(date +%Y%m%d-%H%M%S)"
@@ -1043,7 +1054,7 @@ test "$(stat -c '%s' qwen3-tts-0.6b/anke.spk.bin)" -eq 4096
 #### 第四步：重启 TTS 服务
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 
 ./stop_server.sh
 ./start_server.sh
@@ -1075,7 +1086,7 @@ tail -n 80 llama-server.log
 #### 第五步：进入交互模式测试
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 ./run_interactive.sh
 ```
 
@@ -1113,7 +1124,7 @@ QWEN3_TTS_CHUNK_CHARS=24 ./run_interactive.sh \
 当前交互客户端默认只播放，不自动创建或覆盖 WAV 文件：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 timeout 40s ./run_interactive.sh '这是安可音色的低延迟播放测试。'
 ```
 
@@ -1129,7 +1140,7 @@ timeout 40s ./run_interactive.sh '这是安可音色的低延迟播放测试。'
 
 ```bash
 pgrep -af '[a]play' || true
-find /home/spacemit/projects/qwen3-tts/wav-output -maxdepth 1 -type f -name '.output.wav.part' -print
+find ~/qwen3-tts/wav-output -maxdepth 1 -type f -name '.output.wav.part' -print
 ```
 
 如果要保留 HTTP 返回的 WAV，可继续直接使用 `curl -o` 保存；交互客户端本身不会保存。
@@ -1139,7 +1150,7 @@ find /home/spacemit/projects/qwen3-tts/wav-output -maxdepth 1 -type f -name '.ou
 如果之前保存了带时间戳的备份，可以先列出备份：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 ls -lt qwen3-tts-0.6b/config.json.before-voice-*
 ```
 
@@ -1200,7 +1211,7 @@ curl -f http://127.0.0.1:18080/v1/audio/speech \
 按以下顺序检查，不要只根据文件扩展名判断：
 
 ```bash
-cd /home/spacemit/projects/qwen3-tts
+cd ~/qwen3-tts
 
 # 1. 看配置实际指向哪个文件
 grep -n 'speaker_file' qwen3-tts-0.6b/config.json
