@@ -20,9 +20,31 @@
 | TTS 模型 | Qwen3-TTS 0.6B |
 | 播放 | 24 kHz、16-bit、mono、PCM（通过 aplay 直接播放） |
 | 服务 | `http://127.0.0.1:18080` |
-| Runtime | SpaceMIT 优化版 `llama-server`，当前构建标识 `787e5fcf` |
+| Runtime | SpaceMIT 优化版 `llama-server`，实时 patch 基于 `787e5fc` |
 | ORT | SpaceMIT ONNX Runtime / EP |
 | 音色配置 | `qwen3-tts-0.6b/config.json` 中的 `tts_model.speaker_file`；文件格式为 raw `float32[1024]` |
+
+## 当前实时性配置（real_time 分支）
+
+本分支按“YOLO 同时运行”的部署约束固定 TTS 的 SpaceMIT preferred core 为 **8、9、10、11** 四个核；YOLO 继续使用自己的 EP affinity **14;15**。不要把两者的编号或线程配置混为一谈。
+
+`start_server.sh` 默认导出：
+
+```text
+SPACEMIT_PERFER_CORE_ID=8,9,10,11
+QWEN3_TTS_GEMV_CPU_MASK=4-7
+QWEN3_TTS_THREADPOOL_POLL=50
+```
+
+其中：
+
+- `SPACEMIT_PERFER_CORE_ID` 是 SpaceMIT preferred core 选择；
+- `QWEN3_TTS_GEMV_CPU_MASK=4-7` 只绑定 talker 的 4 个普通 CPU GEMV worker，避免它们和 8-11 的 preferred worker 争抢；
+- `QWEN3_TTS_THREADPOOL_POLL=50` 是 ggml threadpool polling 参数。板端在 YOLO 持续运行时的短文本 A/B 中，`poll=50` 约为 `1.66-1.68`，优于 `poll=0` 的约 `1.71-1.77` 和 `poll=10` 的约 `1.75-1.80`；实际负载变化后仍应重新实测。
+
+这三个变量只有在使用按[实时 patch 构建的 runtime](docs/build-llama-realtime-k3.md)时才会生效。`runtime/bin/` 保留原有可回滚版本；可用 `QWEN3_TTS_RUNTIME=/path/to/runtime-realtime` 试运行新 runtime。
+
+当前播放仍是**完整分段级流式**：服务端先完成一段 WAV，客户端解包 PCM 后立即送入长生命周期 `aplay`；不是服务端逐 PCM 帧真流式。
 
 ## 目录结构
 
@@ -355,11 +377,14 @@ cd ~/src
 # 将 SpaceMIT 定制版 llama.cpp 源码放到此处
 cd llama.cpp
 
-git checkout 787e5fcf
+git checkout 787e5fc
+patch -p1 < /path/to/qwen3-tts/patches/llama.cpp-realtime.patch
 cmake -S . -B build-k3 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_NATIVE=ON \
-  -DLLAMA_BUILD_SERVER=ON
+  -DLLAMA_BUILD_SERVER=ON \
+  -DGGML_CPU_RISCV64_SPACEMIT=ON \
+  -DGGML_RV_ZBA=ON \
+  -DLLAMA_SERVER_SMT_MTMD=ON
 cmake --build build-k3 --target llama-server -j"$(nproc)"
 ```
 
@@ -577,7 +602,7 @@ SpaceMIT ORT：/usr/lib/libonnxruntime.so.1 + /usr/lib/libspacemit_ep.so
 本次测试使用当前板端运行配置：
 
 ```text
-frontend_threads=2
+frontend_threads=4
 codec_threads=4
 talker_threads=4
 SPACEMIT_EP_INTRA_THREAD_NUM=4
@@ -660,7 +685,7 @@ qwen3-tts-0.6b/config.json
 
 ```json
 {
-  "frontend_threads": 2,
+  "frontend_threads": 4,
   "codec_threads": 4,
   "talker_threads": 4,
   "ep_config": {
@@ -680,15 +705,7 @@ qwen3-tts-0.6b/config.json
 | `SPACEMIT_EP_INTRA_THREAD_NUM` | SpaceMIT EP 的内部并行线程数 |
 | `SPACEMIT_EP_INTER_THREAD_NUM` | SpaceMIT EP 图间并行线程数 |
 
-`SPACEMIT_EP_INTRA_THREAD_NUM=4` 只表示启动 4 个 EP worker，不表示选择 A100 `12-15`。当前 Qwen3-TTS runtime 没有在 `config.json` 中暴露类似下面的固定核列表配置：
-
-```json
-{
-  "SPACEMIT_EP_AFFINITY": "12;13;14;15"
-}
-```
-
-因此保持线程数为 4 时，当前默认分配通常是 A100 `8-11`。修改线程配置后必须重启服务：
+`SPACEMIT_EP_INTRA_THREAD_NUM=4` 只表示启动 4 个 EP worker，不负责保存 preferred core 列表。本分支由 `start_server.sh` 的 `SPACEMIT_PERFER_CORE_ID=8,9,10,11` 固定 preferred core。修改线程配置或环境变量后必须重启服务：
 
 ```bash
 python3 - <<'PY'
@@ -698,7 +715,7 @@ from pathlib import Path
 p = Path('qwen3-tts-0.6b/config.json')
 data = json.loads(p.read_text())
 tts = data['tts_model']
-tts['frontend_threads'] = 2
+tts['frontend_threads'] = 4
 tts['codec_threads'] = 4
 tts['talker_threads'] = 4
 tts['ep_config']['SPACEMIT_EP_INTRA_THREAD_NUM'] = '4'
@@ -710,115 +727,35 @@ PY
 ./start_server.sh
 ```
 
-### 使用全部 8 个 A100
+### 不要申请全部 8 个 A100
 
-如果希望 EP 申请全部 8 个首选 A100，可以将内部线程数改为 8：
+本项目的部署约束是 TTS 只使用 `8-11` 四个 preferred core，YOLO 使用 `14;15`。因此不要把 `SPACEMIT_EP_INTRA_THREAD_NUM` 改成 `8`，也不要再使用旧的 `8-13`/`12-15` 示例；保持配置中的 `"4"` 并使用实时 patch runtime。
 
-```bash
-python3 - <<'PY'
-import json
-from pathlib import Path
+### 固定当前 TTS 四个 A100：8-11
 
-p = Path('qwen3-tts-0.6b/config.json')
-data = json.loads(p.read_text())
-data['tts_model']['ep_config']['SPACEMIT_EP_INTRA_THREAD_NUM'] = '8'
-p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
-PY
-
-./stop_server.sh
-./start_server.sh
-```
-
-这表示申请 A100 `8-15` 的 8 个 EP worker，**不是只使用后四个 A100**。如果机器上已经有旧的 `llama-server`，必须先用本项目的 `stop_server.sh` 停止，避免第二个实例报：
-
-```text
-Not enough available AI cores for the thread pool
-```
-
-### 只使用后四个 A100：当前版本的临时方法
-
-当前预编译 Qwen3-TTS runtime 没有提供持久化的 A100 核列表接口。服务已经启动并且 EP worker 仍显示为单核 `8`、`9`、`10`、`11` 时，可以将这四个 worker 一一绑定到 `12`、`13`、`14`、`15`：
+本分支不再使用旧文档中的 `8-13` 或运行后手工改绑方式。启动脚本默认设置：
 
 ```bash
-cd ~/qwen3-tts
-pid="$(cat llama-server.pid)"
-kill -0 "$pid"
-
-for source_cpu in 8 9 10 11; do
-    target_cpu=$((source_cpu + 4))
-    for status in /proc/"$pid"/task/*/status; do
-        tid="${status%/status}"
-        tid="${tid##*/}"
-        affinity="$(awk '/^Cpus_allowed_list:/{print $2}' "$status")"
-        if [[ "$affinity" == "$source_cpu" ]]; then
-            echo "TID=$tid: CPU $source_cpu -> CPU $target_cpu"
-            taskset -pc "$target_cpu" "$tid"
-            break
-        fi
-    done
-done
+export SPACEMIT_PERFER_CORE_ID="${SPACEMIT_PERFER_CORE_ID:-8,9,10,11}"
+export QWEN3_TTS_GEMV_CPU_MASK="${QWEN3_TTS_GEMV_CPU_MASK:-4-7}"
+export QWEN3_TTS_THREADPOOL_POLL="${QWEN3_TTS_THREADPOOL_POLL:-50}"
 ```
 
-检查结果：
+启动日志应出现 `preferred core ids: 8,9,10,11`，并且实时 patch runtime 应出现 4 个 GEMV worker 绑定到 CPU `4,5,6,7`。YOLO 的 `14;15` 是另一套 EP affinity，保持不变。
+
+注意：Linux `Cpus_allowed_list` 只能证明线程亲和性；它不能单独证明实际 AI Core 调度数量。SpaceMIT EP 是否加载仍需检查 `libspacemit_ep.so`，AI Core 利用率则需要驱动 profile 或设备计数器。
+
+### 普通 Linux CPU 亲和性
+
+本分支不使用 `taskset` 把整个 TTS 进程限制到某个 CPU 集合：这样容易把服务主线程、HTTP、音频处理和其他 CPU 工作错误地挤到一起。实时 patch 只把 talker 的 4 个 CPU 侧 GEMV worker 绑定到 `4-7`；SpaceMIT preferred worker 仍由 `SPACEMIT_PERFER_CORE_ID=8,9,10,11` 管理。
+
+如果要临时改变 GEMV worker 的 CPU 集合，可在启动前覆盖：
 
 ```bash
-for status in /proc/"$pid"/task/*/status; do
-    tid="${status%/status}"
-    tid="${tid##*/}"
-    affinity="$(awk '/^Cpus_allowed_list:/{print $2}' "$status")"
-    case "$affinity" in
-        12|13|14|15)
-            echo "TID=$tid affinity=$affinity"
-            ;;
-    esac
-done
+QWEN3_TTS_GEMV_CPU_MASK=0-3 ./start_server.sh
 ```
 
-注意：这种方式只修改**当前进程**。重启服务后，runtime 可能重新把四个 worker 放回 `8-11`。如果需要每次启动自动固定到 `12-15`，需要在 `start_server.sh` 中增加启动后自动识别 EP worker 并执行绑核的逻辑，或者重新编译暴露 affinity 配置的 SpaceMIT runtime。
-
-### X100 CPU 亲和性
-
-如果只想限制 `llama-server` 的普通 Linux CPU 调度范围，可以使用 `taskset`：
-
-```bash
-# 允许主进程和普通 CPU 线程使用全部 X100
-cd ~/qwen3-tts
-taskset -c 0-7 ./start_server.sh
-```
-
-也可以选择指定的 X100 子集：
-
-```bash
-taskset -c 0,2,4,6 ./start_server.sh
-```
-
-这里的 `taskset` 主要约束启动进程继承的 Linux CPU affinity，**不等价于选择 AI Core**。SpaceMIT EP worker 可能在初始化时使用自己的 A100 affinity；要确认实际结果，必须检查每个线程的 `Cpus_allowed_list`。
-
-某些 SSH 登录会话本身已经被限制在 CPU `0-7`。可以先查看：
-
-```bash
-taskset -pc $$
-```
-
-如果输出是：
-
-```text
-current affinity list: 0-7
-```
-
-那么在这个 Shell 中直接执行：
-
-```bash
-taskset -c 12-15 ./start_server.sh
-```
-
-可能会得到：
-
-```text
-taskset: failed to set pid ... affinity: Invalid argument
-```
-
-这不是 Qwen3-TTS 配置文件错误，而是当前 Shell/cpuset 不允许把自身扩展到 `12-15`。此时应使用上面的 EP worker 临时绑核方法，或通过系统级 service/cpuset 配置放开对应 CPU。
+`QWEN3_TTS_GEMV_CPU_MASK` 只在实时 patch runtime 中生效。不要使用 `taskset -c 12-15 ./start_server.sh` 之类会改变整个进程继承 affinity 的命令；当前 SSH/cpuset 可能只允许 `0-7`，并且这不能替代 preferred core 配置。
 
 ### 验证线程和核是否生效
 

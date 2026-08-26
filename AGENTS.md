@@ -167,12 +167,21 @@ grep -E 'libonnxruntime|libspacemit_ep' "/proc/$pid/maps" | awk '{print $6}' | s
 
 ```text
 sample_rate:                    24000
-frontend_threads:               2
+frontend_threads:               4
 codec_threads:                  4
 talker_threads:                 4
 SPACEMIT_EP_INTRA_THREAD_NUM:    4
 SPACEMIT_EP_INTER_THREAD_NUM:    1
 ```
+
+
+## 当前实时优化约束
+
+- TTS 的 SpaceMIT preferred core 固定为 `8,9,10,11` 四个核。
+- YOLO 继续使用 EP affinity `14;15`，不要修改或混用。
+- realtime llama.cpp patch 的 `QWEN3_TTS_GEMV_CPU_MASK=4-7` 只绑定普通 CPU 侧 GEMV worker，不代表 AI Core。
+- `QWEN3_TTS_THREADPOOL_POLL=50` 是当前 YOLO 并行运行时的实测默认值；需要使用实时 patch 构建的 runtime 才会生效。
+- 当前 `qwen3-tts-0.6b/config.json` 使用 `frontend_threads=4`、`codec_threads=4`、`talker_threads=4`、`SPACEMIT_EP_INTRA_THREAD_NUM=4`。
 
 ## 音色能力边界
 

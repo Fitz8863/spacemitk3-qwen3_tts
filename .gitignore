@@ -19,3 +19,7 @@ llama.cpp/
 llama.cpp-optimized/
 spacemit-llama.cpp.riscv64.0.1.7/
 spacemit-ort.riscv64.2.0.6/
+# Local llama.cpp source/build trees and ORT staging used to build realtime runtime
+llama.cpp-realtime/
+runtime-realtime/
+spacemit-ort-build/

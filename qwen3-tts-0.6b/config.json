@@ -14,11 +14,11 @@
     "max_frames": 160,
     "max_prefill": 128,
     "segment_pause_ms": 200,
-    "frontend_threads": 2,
+    "frontend_threads": 4,
     "codec_threads": 4,
     "talker_threads": 4,
     "ep_config": {
-      "SPACEMIT_EP_INTRA_THREAD_NUM": "8",
+      "SPACEMIT_EP_INTRA_THREAD_NUM": "4",
       "SPACEMIT_EP_INTER_THREAD_NUM": "1"
     }
   }
