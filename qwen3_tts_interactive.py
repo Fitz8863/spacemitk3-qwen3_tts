@@ -65,10 +65,16 @@ PREFETCH_CONCURRENCY = max(1, int(os.getenv("QWEN3_TTS_PREFETCH_CONCURRENCY", "2
 @dataclass
 class AudioChunk:
     wav: bytes
-    synth_seconds: float
+    # Wall-clock time observed by this client for one HTTP request. With
+    # prefetch enabled this can include server queueing and HTTP overhead.
+    client_request_seconds: float
+    # Always calculated from the returned WAV duration, so this is the
+    # user-visible request RTF rather than the server's independent metric.
+    client_request_rtf: float | None
+    # Optional server-side metrics returned in X-TTS-* headers.
     audio_seconds: float | None
     wall_seconds: float | None
-    rtf: float | None
+    server_rtf: float | None
 
 
 @dataclass
@@ -305,18 +311,21 @@ def synthesize(text: str) -> AudioChunk:
         raise RuntimeError("服务端没有返回有效的 WAV 音频")
     audio_seconds = header_float("X-TTS-Audio-Seconds")
     wall_seconds = header_float("X-TTS-Wall-Seconds")
-    rtf = header_float("X-TTS-RTF")
-    if rtf is None and audio_seconds and audio_seconds > 0:
-        # Keep the client usable with older servers that do not send the RTF
-        # header. This includes HTTP round-trip time, so the server value is
-        # preferred whenever it is available.
-        rtf = elapsed / audio_seconds
+    server_rtf = header_float("X-TTS-RTF")
+
+    # Do not use X-TTS-Audio-Seconds for the client metric: the displayed
+    # request RTF must be derived from the actual WAV that this request
+    # returned. This also makes the fallback correct for older servers.
+    with wave.open(io.BytesIO(wav), "rb") as wav_file:
+        returned_audio_seconds = wav_file.getnframes() / wav_file.getframerate()
+    client_rtf = (elapsed / returned_audio_seconds) if returned_audio_seconds > 0 else None
     return AudioChunk(
         wav=wav,
-        synth_seconds=elapsed,
+        client_request_seconds=elapsed,
+        client_request_rtf=client_rtf,
         audio_seconds=audio_seconds,
         wall_seconds=wall_seconds,
-        rtf=rtf,
+        server_rtf=server_rtf,
     )
 
 
@@ -440,7 +449,7 @@ def stream_speech(text: str, *, play: bool = STREAM_PLAY_DEFAULT) -> None:
     started = time.monotonic()
     expected_format: tuple[int, int, int, str] | None = None
     total_frames = 0
-    total_synth_seconds = 0.0
+    total_client_request_seconds = 0.0
     total_server_wall_seconds = 0.0
     total_header_audio_seconds = 0.0
     has_server_wall = False
@@ -461,7 +470,7 @@ def stream_speech(text: str, *, play: bool = STREAM_PLAY_DEFAULT) -> None:
     try:
         for index, (chunk_text, audio) in enumerate(zip(chunks, iter_synthesized(chunks)), start=1):
             decoded = decode_chunk(audio)
-            total_synth_seconds += audio.synth_seconds
+            total_client_request_seconds += audio.client_request_seconds
             if audio.wall_seconds is not None and audio.wall_seconds >= 0:
                 total_server_wall_seconds += audio.wall_seconds
                 has_server_wall = True
@@ -485,10 +494,20 @@ def stream_speech(text: str, *, play: bool = STREAM_PLAY_DEFAULT) -> None:
             if player is not None:
                 player.feed(decoded.frames)
 
-            rtf_text = f"RTF={audio.rtf:.2f}" if audio.rtf is not None else "RTF=未知"
+            client_rtf_text = (
+                f"客户端请求RTF={audio.client_request_rtf:.2f}"
+                if audio.client_request_rtf is not None
+                else "客户端请求RTF=未知"
+            )
+            server_rtf_text = (
+                f"服务端RTF={audio.server_rtf:.2f}"
+                if audio.server_rtf is not None
+                else "服务端RTF=未知"
+            )
             print(
-                f"第 {index}/{len(chunks)} 段合成完成：耗时 {audio.synth_seconds:.2f} 秒"
-                f"；音频时长 {decoded.duration:.2f} 秒；{rtf_text}（越小越实时）",
+                f"第 {index}/{len(chunks)} 段合成完成：HTTP请求耗时 {audio.client_request_seconds:.2f} 秒"
+                f"；音频时长 {decoded.duration:.2f} 秒；{client_rtf_text}；{server_rtf_text}"
+                f"（RTF越小越实时）",
                 flush=True,
             )
 
@@ -501,12 +520,20 @@ def stream_speech(text: str, *, play: bool = STREAM_PLAY_DEFAULT) -> None:
                     should_start = index >= 1
                     required = STREAM_MIN_BUFFER
                     estimated_remaining = 0.0
-                    guarded_rtf = max(STREAM_RTF_HINT, audio.rtf or 0.0) * STREAM_RTF_SAFETY
+                    guarded_rtf = max(
+                        STREAM_RTF_HINT,
+                        audio.server_rtf or audio.client_request_rtf or 0.0,
+                    ) * STREAM_RTF_SAFETY
                 else:
                     if has_server_wall and has_header_audio and total_header_audio_seconds > 0:
                         observed_rtf = total_server_wall_seconds / total_header_audio_seconds
                     elif total_frames > 0:
-                        observed_rtf = total_synth_seconds / buffered_seconds
+                        # With concurrent prefetch, summing individual HTTP
+                        # durations overstates the wall-clock wait. At this
+                        # point playback has not started yet, so elapsed wall
+                        # time is the correct client-side fallback.
+                        client_elapsed = time.monotonic() - started
+                        observed_rtf = client_elapsed / buffered_seconds
                     else:
                         observed_rtf = None
                     should_start, required, estimated_remaining, guarded_rtf = playback_start_plan(
@@ -561,24 +588,32 @@ def stream_speech(text: str, *, play: bool = STREAM_PLAY_DEFAULT) -> None:
 
         elapsed = time.monotonic() - started
         if has_server_wall and has_header_audio and total_header_audio_seconds > 0:
-            total_rtf = total_server_wall_seconds / total_header_audio_seconds
-            rtf_source = "服务端统计"
-        elif duration > 0:
-            total_rtf = total_synth_seconds / duration
-            rtf_source = "客户端测量"
+            server_total_rtf = total_server_wall_seconds / total_header_audio_seconds
         else:
-            total_rtf = None
-            rtf_source = "不可用"
-        total_rtf_text = f"{total_rtf:.2f}" if total_rtf is not None else "未知"
+            server_total_rtf = None
+        # This is the end-to-end generation-stage wall-clock RTF. Do not sum
+        # per-request times here: with prefetch workers that would count
+        # overlapping requests more than once.
+        client_total_rtf = (synthesis_elapsed / duration) if duration > 0 else None
+        client_total_rtf_text = f"{client_total_rtf:.2f}" if client_total_rtf is not None else "未知"
+        server_total_rtf_text = f"{server_total_rtf:.2f}" if server_total_rtf is not None else "未知"
         print(
-            f"音频时长：{duration:.2f} 秒；合成耗时：{synthesis_elapsed:.2f} 秒；"
+            f"音频时长：{duration:.2f} 秒；合成阶段墙钟耗时：{synthesis_elapsed:.2f} 秒；"
             f"播放结束耗时：{elapsed:.2f} 秒；首播延迟：{playback_start_after:.2f} 秒",
             flush=True,
         )
         print(
-            f"本轮 RTF：{total_rtf_text}（{rtf_source}；越小越实时；RTF<1 表示快于实时）",
+            f"本轮客户端墙钟RTF：{client_total_rtf_text}；"
+            f"本轮服务端统计RTF：{server_total_rtf_text}"
+            f"（RTF越小越实时；RTF<1 表示快于实时）",
             flush=True,
         )
+        if PREFETCH_CONCURRENCY > 1:
+            print(
+                f"说明：各段HTTP请求耗时相加为 {total_client_request_seconds:.2f} 秒；"
+                "并发预取时包含重叠等待，仅作诊断，不作为本轮墙钟RTF。",
+                flush=True,
+            )
     except Exception:
         if player is not None:
             player.abort()
