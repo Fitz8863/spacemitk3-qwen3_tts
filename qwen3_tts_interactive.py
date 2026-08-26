@@ -2,15 +2,16 @@
 """Qwen3-TTS K3 low-latency interactive streaming player.
 
 The current server returns one complete WAV per request rather than streaming
-PCM frames.  This client therefore implements segment-level streaming: it
-splits the text, synthesizes segments sequentially, starts playback as soon as
-the first short segment is ready, and feeds later PCM segments to one
-long-lived player while they are generated.  No WAV file is written.
+PCM frames.  This client therefore implements ordered segment-level streaming:
+it splits the text, prefetches a small bounded window of segments in parallel,
+starts playback as soon as the first segment is ready, and feeds later PCM
+segments to one long-lived player in text order.  No WAV file is written.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import io
 import json
 import os
@@ -54,6 +55,11 @@ def env_enabled(name: str, default: bool) -> bool:
 
 STREAM_PLAY_DEFAULT = env_enabled("QWEN3_TTS_STREAM_PLAY", True)
 STREAM_LOW_LATENCY = env_enabled("QWEN3_TTS_STREAM_LOW_LATENCY", True)
+# Generate a small ordered window of future segments in parallel.  The client
+# still feeds the player in text order, while the next request can overlap
+# playback of the current segment.  Two workers are a conservative default
+# for the K3 runtime; set this to 1 to restore strictly sequential requests.
+PREFETCH_CONCURRENCY = max(1, int(os.getenv("QWEN3_TTS_PREFETCH_CONCURRENCY", "2")))
 
 
 @dataclass
@@ -314,6 +320,47 @@ def synthesize(text: str) -> AudioChunk:
     )
 
 
+def iter_synthesized(chunks: list[str]):
+    """Yield completed segments in text order with a bounded request window.
+
+    The HTTP endpoint returns a complete WAV per request, so this cannot make
+    one request PCM-streaming.  It does, however, overlap the next segment's
+    server work with playback of the current segment.  Results are yielded in
+    order even when a later request finishes first.
+    """
+    if PREFETCH_CONCURRENCY <= 1 or len(chunks) <= 1:
+        for chunk_text in chunks:
+            yield synthesize(chunk_text)
+        return
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=PREFETCH_CONCURRENCY,
+        thread_name_prefix="qwen3-tts-prefetch",
+    )
+    pending: dict[int, concurrent.futures.Future[AudioChunk]] = {}
+    next_submit = 0
+    try:
+        while next_submit < min(PREFETCH_CONCURRENCY, len(chunks)):
+            pending[next_submit] = executor.submit(synthesize, chunks[next_submit])
+            next_submit += 1
+
+        for index in range(len(chunks)):
+            # Waiting for this exact index preserves speech order.  As soon as
+            # it is consumed, refill the bounded window with the next request.
+            audio = pending.pop(index).result()
+            if next_submit < len(chunks):
+                pending[next_submit] = executor.submit(synthesize, chunks[next_submit])
+                next_submit += 1
+            yield audio
+    except BaseException:
+        for future in pending.values():
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+
 def decode_chunk(audio: AudioChunk) -> DecodedChunk:
     with wave.open(io.BytesIO(audio.wav), "rb") as reader:
         audio_format = (
@@ -412,8 +459,7 @@ def stream_speech(text: str, *, play: bool = STREAM_PLAY_DEFAULT) -> None:
     print(f"已分成 {len(chunks)} 段，开始合成（{mode}）……", flush=True)
 
     try:
-        for index, chunk_text in enumerate(chunks, start=1):
-            audio = synthesize(chunk_text)
+        for index, (chunk_text, audio) in enumerate(zip(chunks, iter_synthesized(chunks)), start=1):
             decoded = decode_chunk(audio)
             total_synth_seconds += audio.synth_seconds
             if audio.wall_seconds is not None and audio.wall_seconds >= 0:
@@ -580,6 +626,7 @@ def main() -> int:
     print(f"- 播放缓冲：{PLAYBACK_BUFFER_TIME_US / 1000:.0f} ms；周期：{PLAYBACK_PERIOD_TIME_US / 1000:.0f} ms")
     print(f"- 分段上限：{MAX_CHARS} 字符；首段就绪后目标缓冲：{STREAM_MIN_BUFFER:.2f} 秒")
     print(f"- 低延迟模式：{'是' if STREAM_LOW_LATENCY else '否'}")
+    print(f"- 并行预取：{PREFETCH_CONCURRENCY} 段（按原顺序播放；设 QWEN3_TTS_PREFETCH_CONCURRENCY=1 可关闭）")
 
     while True:
         try:
