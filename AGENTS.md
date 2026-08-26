@@ -2,23 +2,18 @@
 
 此文件供新的 Codex 会话快速接手。开始工作时先读本文档，再用实时进程、文件和日志验证状态。
 
-## 当前用户需求（2026-08-22 更新）
+## 当前用户需求（2026-08-26 更新）
 
 当前交互程序的行为是：
 
 ```text
-输入文字 -> 回车 -> K3 合成 -> 原子覆盖 wav-output/output.wav -> 不播放
+输入文字 -> 回车 -> 分段合成 -> 第一段完整返回后立即启动 aplay -> 后续分段边生成边播放
 ```
 
-固定输出文件：
+默认交互路径只播放，不保存 WAV。`--no-play` 仅用于不启动播放器的合成测速，也不保存 WAV。
 
-```text
-/home/spacemit/projects/qwen3-tts/wav-output/output.wav
-```
+当前实现是“完整分段级流式”，不是服务端逐 PCM 帧真流式：服务端仍要先完成一段 WAV，客户端解包为 PCM 后，通过一个长生命周期的 `aplay` raw PCM 进程播放。低延迟模式不等待覆盖整个 RTF 亏空，RTF 大于 1 时可能出现分段之间短暂停顿。
 
-输出位置与启动程序时的 Shell 工作目录无关。每次成功合成后覆盖上一份 WAV，不创建时间戳文件。
-
-旧的板端 `aplay` 自动播放模式已停用。不要把当前实现描述成“不落盘”或“自动播放”。历史播放版备份已移出项目目录，当前仓库只保留不播放的 WAV 保存实现。
 
 ## 环境
 
@@ -99,34 +94,28 @@ QWEN3_TTS_CHUNK_CHARS=24 ./run_interactive.sh
 
 退出交互：输入 `quit`、`exit` 或 `退出`。
 
-## WAV 保存实现
+## 播放实现
 
 代码位于 `qwen3_tts_interactive.py`：
 
 - `split_text()`：按自然标点或长度分段；英文避免截断单词；缺少结束标点时自动补齐，以降低 `frame limit without EOS` 风险。
 - `synthesize()`：请求 `POST /v1/audio/speech`，每段返回完整 WAV 字节。
-- `output_path()`：创建项目内的 `wav-output` 目录，并返回固定的 `output.wav` 路径。
-- `save_speech()`：解析每段 WAV，校验声道数、采样位宽、采样率和压缩格式，再把 PCM frame 写进同一个 WAV 容器。
+- `decode_chunk()`：解析 WAV，只提取并校验 PCM frame。
+- `StreamingPlayer`：启动一个长生命周期 `aplay` raw PCM 进程，后台线程按分段写入；队列有界，避免积压导致播放延迟不断增加。
+- `stream_speech()`：首段完整 WAV 返回后立即播放，后续分段合成完成即继续送入播放器。
 
-不要使用二进制 `wav1 + wav2` 直接拼接；每段都有 RIFF/WAV 头，直接拼接会产生无效或只播放第一段的文件。
-
-保存过程：
-
-1. 在 `wav-output` 中创建隐藏的 `.output.wav.part`。
-2. 逐段合成并将 PCM frame 写入一个 WAV writer。
-3. 所有分段成功后使用 `os.replace()` 原子改为最终 `.wav`。
-4. 任何异常都会尝试删除 `.part`，避免留下看似完整的损坏文件。
-
-当前输出应为：
+默认播放参数：
 
 ```text
-24000 Hz
-16-bit
-mono
-PCM/uncompressed WAV
+24 kHz / 16-bit / mono / PCM
+QWEN3_TTS_PLAYBACK_BUFFER_US=250000
+QWEN3_TTS_PLAYBACK_PERIOD_US=30000
+QWEN3_TTS_PLAYBACK_START_DELAY_US=0
+QWEN3_TTS_PLAYBACK_QUEUE_SEGMENTS=2
 ```
 
-实际验证时必须用 `wave`、`file` 或 `ffprobe` 检查，不要仅根据扩展名判断。
+当前默认不创建或覆盖 `wav-output/output.wav`，也不创建 `.part` 文件。
+
 
 ## 模型与 Runtime
 
@@ -190,7 +179,7 @@ SPACEMIT_EP_INTER_THREAD_NUM:    1
 当前加载：
 
 ```text
-qwen3-tts-0.6b/default.spk.bin
+qwen3-tts-0.6b/anke.spk.bin
 ```
 
 Runtime 读取的 speaker 文件格式是 raw `float32[1024]`，即 4096 字节。模型底座属于支持 voice cloning 的 Qwen3-TTS Base 路线，但当前 K3 HTTP 服务没有实现直接上传 `ref_audio`/`ref_text` 并现场提取音色。不要把“底层模型支持克隆”错误表述为“当前接口已能直接上传录音克隆”。
@@ -203,7 +192,8 @@ Runtime 读取的 speaker 文件格式是 raw `float32[1024]`，即 4096 字节�
 每段文本 -> 完整生成该段 WAV -> 返回完整 HTTP 响应
 ```
 
-交互程序现在也不播放，只把各段 PCM 合并保存为一个文件。若未来实现真流式，需要修改 C++ talker/codec 回调和传输接口，不能仅改 Python 播放/保存层。
+交互程序实现的是低延迟分段级流式播放：第一段完整返回后立即启动 `aplay`，主线程继续生成后续分段并将 PCM 送入同一播放器。由于当前板端实测短句 RTF 大约在 `1.12-1.45`，低延迟模式优先首播速度，不能保证长文本全程无缝；若需要更少停顿，可设 `QWEN3_TTS_STREAM_LOW_LATENCY=0` 使用保守 RTF 预缓冲模式。
+
 
 ## CPU、EP 线程和 AI Core
 
@@ -234,49 +224,39 @@ tail -n 100 llama-server.log
 5. 修改交互代码后至少验证：
    - `python3 -m py_compile qwen3_tts_interactive.py`
    - `/health` 正常
-   - 单段中文生成成功
-   - 多段文本合并成功
-   - 输出固定为项目内 `wav-output/output.wav`
-   - 连续生成会覆盖旧文件且目录内不累积时间戳 WAV
-   - WAV 是 24 kHz、16-bit、mono、PCM
-   - 没有残留 `.part`
-   - 代码没有调用 `aplay`
+   - 单段中文直接播放成功
+   - 多段文本生成期间播放器已启动并继续消费后续分段
+   - 默认运行不修改 `wav-output/output.wav`
+   - 默认运行不产生 `.output.wav.part`
+   - 播放格式为 24 kHz、16-bit、mono、PCM
+   - 播放结束后无残留 `aplay`
+   - `--no-play` 模式能只合成并打印 RTF
 6. 不要把“ORT 能运行”“加载 SpaceMIT EP”“全图使用 AI Core”混为一谈。
 7. 向用户报告真实生成路径、文件大小、音频时长和耗时。
 
 ## 快速回归
 
-从项目目录交互生成：
+短文本直接播放：
 
 ```bash
-ssh spacemit-k3 "cd /home/spacemit/projects/qwen3-tts && printf '%s\n%s\n' '你好，保存测试。' '退出' | timeout 40s ./run_interactive.sh"
+ssh spacemit-k3 "cd /home/spacemit/projects/qwen3-tts && timeout 40s ./run_interactive.sh '你好，这是低延迟播放测试。'"
 ```
 
-从其他目录验证固定保存位置：
+多段流式播放：
 
 ```bash
-ssh spacemit-k3 "cd /tmp && timeout 40s /home/spacemit/projects/qwen3-tts/run_interactive.sh '固定输出目录测试。'"
+ssh spacemit-k3 "cd /home/spacemit/projects/qwen3-tts && timeout 90s ./run_interactive.sh '这是一段较长的文本，用来确认第一段播放后，后续分段仍然可以继续生成并立即播放。'"
 ```
 
-检查最近 WAV：
+不播放测速：
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-import wave
-p = Path('/home/spacemit/projects/qwen3-tts/wav-output/output.wav')
-with wave.open(str(p), 'rb') as w:
-    print(p.resolve())
-    print('channels=', w.getnchannels())
-    print('sample_width=', w.getsampwidth())
-    print('sample_rate=', w.getframerate())
-    print('frames=', w.getnframes())
-    print('seconds=', w.getnframes() / w.getframerate())
-PY
+ssh spacemit-k3 "cd /home/spacemit/projects/qwen3-tts && timeout 40s ./run_interactive.sh --no-play '低延迟模式测速。'"
 ```
 
-检查临时文件：
+检查播放器和临时文件：
 
 ```bash
+pgrep -af '[a]play' || true
 find /home/spacemit/projects/qwen3-tts/wav-output -maxdepth 1 -type f -name '.output.wav.part' -print
 ```
